@@ -102,6 +102,7 @@ else:
 class ProductCard(BaseModel):
     title_ru_short: str = Field(description="Короткое название товара на русском языке")
     title_ru: str = Field(description="SEO-оптимизированное название товара на русском языке")
+    brand: str = Field(description="Бренд товара (название производителя или торговой марки)")
     sku: str = Field(description="Артикул или уникальный код модели")
     description_ru: str = Field(description="Описание товара для покупателя")
     category: str = Field(description="Категория товара")
@@ -142,6 +143,7 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
                 return ProductCard(
                     title_ru_short=f"Премиальная модель {extracted_sku}",
                     title_ru=f"Премиальная модель {extracted_sku}",
+                    brand="Премиальный бренд",
                     sku=extracted_sku,
                     description_ru=f"Локальный тест. Сырой текст: {raw_text.strip()[:40]}...",
                     category="Одежда и Аксессуары",
@@ -198,6 +200,7 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
                     "{\n"
                     '  "title_ru_short": "Сумка женская через плечо - Louis Vuitton - Speedy P9",\n'
                     '  "title_ru": "Сумка Louis Vuitton Speedy P9 Bandoulière 25",\n'
+                    '  "brand": "Louis Vuitton",\n'
                     '  "sku": "M27769",\n'
                     '  "description_ru": "Сумка Louis Vuitton Speedy P9 — это ультрасовременное переосмысление культового силуэта. Модель выполнена из мягкой кожи теленка премиум-качества.\\n\\n<h3>Особенности модели</h3>\\n• <strong>Эксклюзивный принт:</strong> Монограмма нанесена методом высокоточной печати.\\n• <strong>Внимание к деталям:</strong> Вся фурнитура покрыта золотым напылением.",\n'
                     '  "category": "Сумки",\n'
