@@ -18,6 +18,7 @@ load_dotenv()
 
 # ==================== СЧИТЫВАНИЕ CONFIG ИЗ .env ====================
 ALBUM_ID = os.getenv("ALBUM_ID", "_ZZajIW0nut8N3cyxzlhAGRf9BcyL4ZIU")
+SHOP_ID = os.getenv("SHOP_ID", "").strip()
 TARGET_URL = f"https://www.szwego.com/album/personal/all"
 
 AI_PROVIDER = os.getenv("AI_PROVIDER", "openrouter").lower()
@@ -342,40 +343,78 @@ async def main(target_limit: int = None):
             json.dump(final_catalog, f, indent=2, ensure_ascii=False)
 
 def extract_item_id(url: str) -> Optional[str]:
-    """Вытаскивает id товара (последний сегмент пути после theme_detail/)"""
-    match = re.search(r"theme_detail/[^/]+/([^/?#]+)", url)
+    """Вытаскивает id товара (последний сегмент после theme_detail/ или goods_detail/)."""
+    match = re.search(r"(?:theme_detail|goods_detail)/[^/]+/([^/?#]+)", url)
     return match.group(1) if match else None
 
-async def fetch_single_item_raw_url(original_url: str) -> Dict[str, Any]:
-    """
-    Вытаскивает параметры из браузерной ссылки и делает прямой запрос 
-    к эндпоинту /commodity/view на основном домене www.szwego.com.
-    """
-    # 1. Извлекаем targetAlbumId и itemId (theme_id) из хвоста ссылки
-    ids_match = re.search(r"theme_detail/([^/]+)/([^/?#]+)", original_url)
-    if not ids_match:
-        print("❌ Ошибка: Не удалось извлечь идентификаторы товара из ссылки!")
-        return {}
-        
-    target_album_id = ids_match.group(1)
-    item_id = ids_match.group(2)
-    
-    # 2. Извлекаем shop_id из параметров ссылки
-    shop_match = re.search(r"shop_id=([^&]+)", original_url)
-    if not shop_match:
-        print("❌ Ошибка: Не удалось найти shop_id в ссылке!")
-        return {}
-    shop_id = shop_match.group(1)
+def extract_shop_id_from_url(url: str) -> Optional[str]:
+    """shop_id может быть в query (?shop_id=...) или в поддомене (a123....szwego.com)."""
+    shop_match = re.search(r"[?&]shop_id=([^&]+)", url)
+    if shop_match:
+        return shop_match.group(1)
 
-    # 3. Собираем правильный URL на основном домене www.szwego.com
+    subdomain_match = re.search(r"https?://([a-zA-Z0-9_-]+)\.szwego\.com", url)
+    if subdomain_match:
+        subdomain = subdomain_match.group(1)
+        if subdomain not in ("www", "m", "api", "szwego"):
+            return subdomain
+
+    return None
+
+
+def normalize_shop_id(value: str) -> str:
+    value = value.strip()
+    if re.match(r"^A\d+$", value):
+        return f"a{value[1:]}"
+    return value
+
+
+def is_numeric_shop_id(value: str) -> bool:
+    return bool(re.match(r"^[Aa]\d{10,}$", value))
+
+
+def resolve_shop_id_candidates(url: str) -> List[Optional[str]]:
+    """Список shop_id для перебора: из URL, .env, либо запрос без shopId (None)."""
+    candidates: List[Optional[str]] = []
+
+    url_shop_id = extract_shop_id_from_url(url)
+    if url_shop_id:
+        candidates.append(normalize_shop_id(url_shop_id))
+    else:
+        if SHOP_ID:
+            candidates.append(normalize_shop_id(SHOP_ID))
+        if is_numeric_shop_id(ALBUM_ID):
+            normalized_album_shop = normalize_shop_id(ALBUM_ID)
+            if normalized_album_shop not in candidates:
+                candidates.append(normalized_album_shop)
+        candidates.append(None)
+
+    seen = set()
+    unique_candidates: List[Optional[str]] = []
+    for candidate in candidates:
+        key = candidate or ""
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_candidates.append(candidate)
+
+    return unique_candidates
+
+
+async def _request_commodity_view(
+    target_album_id: str,
+    item_id: str,
+    shop_id: Optional[str] = None,
+) -> Dict[str, Any]:
     api_url = (
         f"https://szwego.com/commodity/view"
         f"?targetAlbumId={target_album_id}"
         f"&itemId={item_id}"
-        f"&shopId={shop_id}"
         f"&transLang=en"
     )
-        
+    if shop_id:
+        api_url += f"&shopId={shop_id}"
+
     local_headers = {
         "accept": "application/json, text/plain, */*",
         "accept-language": "ru,ru-RU;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -397,41 +436,110 @@ async def fetch_single_item_raw_url(original_url: str) -> Dict[str, Any]:
         "wego-version": "",
         "x-wg-language": "zh"
     }
-    
+
     local_cookies = {
         "token": str(SZWEGO_TOKEN),
         "googtrans": "/en/ru"
     }
-    
-    try:
-        # Важно: отключаем автоматический редирект, чтобы httpx не прыгал, если сессия моргнет
-        async with httpx.AsyncClient(headers=local_headers, cookies=local_cookies, timeout=15.0) as client:
-            response = await client.get(api_url, follow_redirects=False)
 
-            # try:
-            #     # Предполагаем, что Szwego отдает JSON. Если отдает HTML — запишем как текст.
-            #     try:
-            #         debug_data = response.json()
-            #         with open("szwego_debug_response.json", "w", encoding="utf-8") as f:
-            #             json.dump(debug_data, f, ensure_ascii=False, indent=4)
-            #         logging.info(f" [DEBUG] Сырой JSON успешно сохранен в szwego_debug_response.json. Ключи: {list(debug_data.keys())}")
-            #     except Exception:
-            #         with open("szwego_debug_response.html", "w", encoding="utf-8") as f:
-            #             f.write(response.text)
-            #         logging.info(f" [DEBUG] Сервер вернул HTML. Сохранено в szwego_debug_response.html (Длина: {len(response.text)})")
-            # except Exception as debug_err:
-            #     logging.error(f" Не удалось сохранить отладочный дамп: {debug_err}")
+    async with httpx.AsyncClient(headers=local_headers, cookies=local_cookies, timeout=15.0) as client:
+        response = await client.get(api_url, follow_redirects=False)
 
-            if response.status_code == 200:
-                res_json = response.json()
-                if res_json.get("errcode") != 0:
-                    print(f"⚠️ Ошибка Szwego API: {res_json.get('errmsg')}")
-                    return {}
-                return res_json.get("result", res_json)
-                
+        if response.status_code != 200:
             print(f"⚠️ Неожиданный ответ сервера. Код: {response.status_code}. Текст: {response.text[:200]}")
             return {}
-            
+
+        res_json = response.json()
+        if res_json.get("errcode") != 0:
+            shop_hint = shop_id or "(без shopId)"
+            print(f"⚠️ Szwego API [{shop_hint}]: {res_json.get('errmsg')}")
+            return {}
+
+        return res_json.get("result", res_json)
+
+
+def parse_szwego_url(url: str) -> Dict[str, Optional[str]]:
+    """Разбирает ссылку Szwego: товар (theme_detail) или магазин (shop_detail)."""
+    shop_id = extract_shop_id_from_url(url)
+
+    product_match = re.search(r"(?:theme_detail|goods_detail)/([^/]+)/([^/?#]+)", url)
+    if product_match:
+        return {
+            "link_type": "product",
+            "target_album_id": product_match.group(1),
+            "item_id": product_match.group(2),
+            "shop_id": shop_id,
+        }
+
+    shop_match = re.search(r"shop_detail/([^/?#]+)", url)
+    if shop_match:
+        return {
+            "link_type": "shop",
+            "target_album_id": shop_match.group(1),
+            "item_id": None,
+            "shop_id": shop_id,
+        }
+
+    return {
+        "link_type": "unknown",
+        "target_album_id": None,
+        "item_id": None,
+        "shop_id": shop_id,
+    }
+
+
+def print_shop_link_hint(album_id: str) -> None:
+    print("❌ Это ссылка на МАГАЗИН (shop_detail), а не на конкретный товар.")
+    print("   Режим «поштучного сбора» работает только со ссылкой на товар.")
+    print()
+    print("   Как получить правильную ссылку:")
+    print("   1. Откройте магазин в браузере")
+    print("   2. Кликните на нужный товар")
+    print("   3. Скопируйте ссылку — в ней должен быть theme_detail и ДВА ID:")
+    print(f"      ...#/theme_detail/{album_id}/XXXXX_товара")
+    print()
+    print("   Либо используйте «Массовый парсинг каталога» и укажите в .env:")
+    print(f'      ALBUM_ID="{album_id}"')
+
+
+async def fetch_single_item_raw_url(original_url: str) -> Dict[str, Any]:
+    """
+    Вытаскивает параметры из браузерной ссылки и делает прямой запрос 
+    к эндпоинту /commodity/view на основном домене www.szwego.com.
+    """
+    parsed = parse_szwego_url(original_url)
+
+    if parsed["link_type"] == "shop":
+        print_shop_link_hint(parsed["target_album_id"] or "")
+        return {}
+
+    if parsed["link_type"] != "product":
+        print("❌ Ошибка: Не удалось распознать ссылку Szwego!")
+        print("   Ожидается формат: ...#/theme_detail/АЛЬБОМ/ТОВАР")
+        return {}
+
+    target_album_id = parsed["target_album_id"]
+    item_id = parsed["item_id"]
+    shop_candidates = resolve_shop_id_candidates(original_url)
+
+    if extract_shop_id_from_url(original_url) is None:
+        print(f"ℹ️ shop_id в ссылке не найден — пробуем {len(shop_candidates)} вариант(ов) запроса...")
+
+    try:
+        for shop_id in shop_candidates:
+            item_data = await _request_commodity_view(target_album_id, item_id, shop_id)
+            if item_data:
+                if shop_id:
+                    print(f"✅ Товар получен (shopId={shop_id})")
+                else:
+                    print("✅ Товар получен (запрос без shopId)")
+                return item_data
+
+        print("❌ Не удалось получить данные товара ни одним из способов.")
+        if not extract_shop_id_from_url(original_url) and not SHOP_ID and not is_numeric_shop_id(ALBUM_ID):
+            print("   Подсказка: добавьте в .env SHOP_ID=a201903291406004270013266")
+            print("   (ID магазина из поддомена ссылки или из DevTools → Network).")
+        return {}
     except Exception as e:
         print(f"\n❌ Ошибка сети при поштучном запросе: {e}")
         return {}
@@ -447,7 +555,7 @@ def save_to_raw_dump(item_data: dict, original_url: str):
             data = []
             
     # Защита: вытаскиваем уникальный ID товара из самой ссылки Павла, если API его не вернуло
-    item_id_match = re.search(r"theme_detail/[^/]+/([^/?#]+)", original_url)
+    item_id_match = re.search(r"(?:theme_detail|goods_detail)/[^/]+/([^/?#]+)", original_url)
     fallback_id = item_id_match.group(1) if item_id_match else f"id_{int(time.time()*1000)}"
     
     current_id = item_data.get("id") or item_data.get("itemId") or fallback_id
