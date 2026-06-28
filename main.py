@@ -5,7 +5,7 @@ import os
 import re
 from typing import Dict, Any, List, Optional
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from dotenv import load_dotenv
 import sys
 import argparse
@@ -37,8 +37,12 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-# Считываем модель из .env, по умолчанию ставим дешевую gpt-4o-mini в формате OpenRouter
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.5-flash")
+# Считываем модель из .env. По умолчанию — точная gemini-3.1-pro-preview в формате OpenRouter
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-3.1-pro-preview")
+# Модель для нативного провайдера Gemini (без OpenRouter)
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
+# Температура генерации: ниже = меньше выдумок (важно для артикулов)
+AI_TEMPERATURE = float(os.getenv("AI_TEMPERATURE", 0.4))
 # ===================================================================
 # ИИ-Клиенты
 openai_client = None
@@ -95,7 +99,7 @@ elif AI_PROVIDER == "gemini":
         raise ValueError("[ERROR] Выбран Gemini, но GEMINI_API_KEY не найден в .env!")
     gemini_client = genai.Client(api_key=GEMINI_API_KEY)
     from google.genai import types
-    print("[INIT] Режим: Боевой Google Gemini (gemini-2.5-flash)")
+    print(f"[INIT] Режим: Боевой Google Gemini ({GEMINI_MODEL})")
 
 else:
     print("[INIT] Режим: Локальный автономный MOCK (ИИ отключен, лимиты не тратятся)")
@@ -108,6 +112,67 @@ class ProductCard(BaseModel):
     description_ru: str = Field(description="Описание товара для покупателя")
     category: str = Field(description="Категория товара")
     tags: List[str] = Field(description="Список ключевых слов")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_ai_payload(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        if "product_card" in data and isinstance(data["product_card"], dict):
+            data = data["product_card"]
+
+        aliases = {
+            "title": "title_ru",
+            "description": "description_ru",
+            "category_ru": "category",
+            "short_title": "title_ru_short",
+        }
+        for old_key, new_key in aliases.items():
+            if old_key in data and new_key not in data:
+                data[new_key] = data[old_key]
+
+        title = data.get("title_ru") or data.get("title_ru_short") or data.get("title") or "Товар"
+        data.setdefault("title_ru_short", title)
+        data.setdefault("title_ru", title)
+        data.setdefault("description_ru", data.get("description") or "")
+        data.setdefault("brand", "Премиальный бренд")
+        data.setdefault("sku", "N/A")
+        data.setdefault("category", "Одежда и Аксессуары")
+        data.setdefault("tags", [])
+
+        return data
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def coerce_tags(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [tag.strip() for tag in re.split(r"[,;|]", value) if tag.strip()]
+        if isinstance(value, list):
+            return [str(tag).strip() for tag in value if str(tag).strip()]
+        return []
+
+    @field_validator("sku", "category", "brand", mode="before")
+    @classmethod
+    def coerce_required_strings(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    @model_validator(mode="after")
+    def fill_empty_strings(self) -> "ProductCard":
+        if not self.sku:
+            object.__setattr__(self, "sku", "N/A")
+        if not self.category:
+            object.__setattr__(self, "category", "Одежда и Аксессуары")
+        if not self.brand:
+            object.__setattr__(self, "brand", "Премиальный бренд")
+        if not self.tags:
+            fallback_tags = [tag for tag in (self.brand, self.category) if tag and tag not in ("N/A", "Одежда и Аксессуары", "Премиальный бренд")]
+            object.__setattr__(self, "tags", fallback_tags or ["lux"])
+        return self
 
 HEADERS = {
     "accept": "application/json, text/javascript, */*; q=0.01",
@@ -158,13 +223,13 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
                 response = await loop.run_in_executor(
                     None,
                     lambda: gemini_client.models.generate_content(
-                        model='gemini-2.5-flash',
+                        model=GEMINI_MODEL,
                         contents=user_prompt,
                         config=types.GenerateContentConfig(
                             system_instruction=system_prompt,
                             response_mime_type="application/json",
                             response_schema=ProductCard,
-                            temperature=0.7
+                            temperature=AI_TEMPERATURE
                         )
                     )
                 )
@@ -179,7 +244,7 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
                         {"role": "user", "content": user_prompt}
                     ],
                     response_format=ProductCard,
-                    temperature=0.7,
+                    temperature=AI_TEMPERATURE,
                     timeout=30.0
                 )
                 # ИСПРАВЛЕНО: добавлен индекс [0] для выбора первого варианта ответа
@@ -196,13 +261,14 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
                     "X-Title": "Szwego AI Parser"
                 }
 
-                # Обновленный пример с демонстрацией HTML-тегов для ИИ
+                # Пример показывает ТОЛЬКО формат ключей и HTML-разметку.
+                # Значение sku здесь специально "N/A", чтобы модель не копировала чужой артикул.
                 json_example = (
                     "{\n"
                     '  "title_ru_short": "Сумка женская через плечо - Louis Vuitton - Speedy P9",\n'
                     '  "title_ru": "Сумка Louis Vuitton Speedy P9 Bandoulière 25",\n'
                     '  "brand": "Louis Vuitton",\n'
-                    '  "sku": "M27769",\n'
+                    '  "sku": "N/A",\n'
                     '  "description_ru": "Сумка Louis Vuitton Speedy P9 — это ультрасовременное переосмысление культового силуэта. Модель выполнена из мягкой кожи теленка премиум-качества.\\n\\n<h3>Особенности модели</h3>\\n• <strong>Эксклюзивный принт:</strong> Монограмма нанесена методом высокоточной печати.\\n• <strong>Внимание к деталям:</strong> Вся фурнитура покрыта золотым напылением.",\n'
                     '  "category": "Сумки",\n'
                     '  "tags": ["Louis Vuitton", "Speedy", "Сумка"]\n'
@@ -214,7 +280,13 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
                     f"Выдай ответ СТРОГО в формате JSON, соответствующем этой структуре ключей:\n{json_example}\n"
                     f"КРИТИЧЕСКИЕ ПРАВИЛА:\n"
                     f"1. Не используй markdown разметку ```json и ```. Начни ответ сразу с {{ и закончи }}.\n"
-                    f"2. Все ключи в JSON должны быть плоскими (без вложений)."
+                    f"2. Все ключи в JSON должны быть плоскими (без вложений).\n"
+                    f"3. Поле tags — только JSON-массив строк, не строка через запятую.\n"
+                    f"4. Поля sku и category всегда строки.\n"
+                    f"5. АРТИКУЛ (sku): бери ТОЛЬКО реальный код модели из текста поставщика выше. "
+                    f"ЗАПРЕЩЕНО придумывать артикул, брать его из примера в этой инструкции "
+                    f"(значение \"N/A\" в примере — это НЕ артикул товара) или использовать ID/ссылку Szwego. "
+                    f"Если в тексте поставщика нет явного артикула — пиши строго sku: \"N/A\"."
                 )
 
                 payload = {
@@ -223,7 +295,7 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
                         {"role": "system", "content": mcp_system_content},  # <-- Просто передаем переменную
                         {"role": "user", "content": user_prompt}
                     ],
-                    "temperature": 0.7
+                    "temperature": AI_TEMPERATURE
                 }
                 
                 async with httpx.AsyncClient(timeout=45.0) as client:

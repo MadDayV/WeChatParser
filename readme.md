@@ -32,7 +32,7 @@ SZWEGO_SAFE_PAUSE=12.0               # Безопасная пауза в сек
 SZWEGO_TOKEN=Mzk4MDk3Q0E5RT...       # Токен авторизации (из Cookies, ключ 'token')
 AI_PROVIDER=openrouter               # Провайдер: gemini / openai / openrouter / mock
 OPENROUTER_API_KEY=sk-or-...        # Ключ OpenRouter (если выбран данный провайдер)
-OPENROUTER_MODEL=google/gemini-2.5-flash # Используемая модель ИИ
+OPENROUTER_MODEL=google/gemini-3.1-pro-preview # Используемая модель ИИ (можно сменить в настройках)
 ```
 
 ### 2. Кастомизация промпта в `ai_prompt.txt`:

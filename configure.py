@@ -10,7 +10,8 @@ def get_current_env_values() -> dict:
         "AI_PROVIDER": "mock",
         "GEMINI_API_KEY": "",
         "OPENAI_API_KEY": "",
-        "OPENROUTER_API_KEY": ""
+        "OPENROUTER_API_KEY": "",
+        "OPENROUTER_MODEL": "google/gemini-3.1-pro-preview"
     }
     if os.path.exists(".env"):
         try:
@@ -80,6 +81,7 @@ def main():
     gemini_key = current["GEMINI_API_KEY"]
     openai_key = current["OPENAI_API_KEY"]
     openrouter_key = current["OPENROUTER_API_KEY"]
+    openrouter_model = current["OPENROUTER_MODEL"]
     
     # 4. Проверка ключей в зависимости от выбора
     if ai_provider == "gemini":
@@ -109,6 +111,16 @@ def main():
             print(" Ключ не введен! Переключаю в режим 'mock'.")
             ai_provider = "mock"
 
+        # Выбор модели OpenRouter (Enter — оставить текущую)
+        if ai_provider == "openrouter":
+            print(f"ℹ️ Текущая модель: {openrouter_model}")
+            print("   Примеры: google/gemini-3.1-pro-preview (точнее, дороже)")
+            print("            google/gemini-2.5-flash (дешевле, быстрее)")
+            print("            anthropic/claude-sonnet-4.5")
+            model_input = input("👉 Введите slug модели OpenRouter или Enter для сохранения текущей: ").strip()
+            if model_input:
+                openrouter_model = model_input
+
     # Запись новой конфигурации
     with open(".env", "w", encoding="utf-8") as f:
         f.write("# Настройки парсера Szwego\n")
@@ -120,7 +132,7 @@ def main():
         f.write(f'GEMINI_API_KEY="{gemini_key}"\n')
         f.write(f'OPENAI_API_KEY="{openai_key}"\n')
         f.write(f'OPENROUTER_API_KEY="{openrouter_key}"\n')
-        f.write(f'OPENROUTER_MODEL="google/gemini-2.5-flash"\n')
+        f.write(f'OPENROUTER_MODEL="{openrouter_model}"\n')
         
     print("\n[✅] Настройки файла .env успешно обновлены!")
     
