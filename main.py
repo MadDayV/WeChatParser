@@ -1,4 +1,5 @@
 import asyncio
+import csv
 import json
 import time
 import os
@@ -663,6 +664,24 @@ async def run_single_mode(url: str):
     else:
         print("❌ Не удалось получить данные товара.")
 
+def format_card_for_export(card_data: dict) -> dict:
+    """Подготавливает строку для CSV: пустой sku, теги через запятую, одна строка на товар."""
+    row = dict(card_data)
+    sku = str(row.get("sku", "")).strip()
+    if not sku or sku.upper() == "N/A":
+        row["sku"] = ""
+    tags = row.get("tags", [])
+    if isinstance(tags, list):
+        row["tags"] = ", ".join(str(tag).strip() for tag in tags if str(tag).strip())
+    elif tags is None:
+        row["tags"] = ""
+    else:
+        row["tags"] = str(tags).strip()
+    for field in ("description_ru", "title_ru", "title_ru_short"):
+        if field in row and row[field]:
+            row[field] = re.sub(r"\s*\n\s*", " ", str(row[field])).strip()
+    return row
+
 async def process_and_export_table(raw_items: list):
     """Принимает список сырых товаров, прогоняет через ИИ и делает экспорт"""
     if not raw_items:
@@ -739,19 +758,27 @@ async def process_and_export_table(raw_items: list):
     with open("final_products.json", "w", encoding="utf-8") as f:
         json.dump(final_cards, f, ensure_ascii=False, indent=4)
 
-    df = pd.DataFrame(final_cards)
+    export_rows = [format_card_for_export(card) for card in final_cards]
+    df = pd.DataFrame(export_rows)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    excel_name = f"products_export_{timestamp}.xlsx"
+    csv_name = f"products_export_{timestamp}.csv"
     
-    df.to_excel(excel_name, index=False)
-    print(f"\n📊 БОМБА! Итоговая таблица создана: {excel_name}")
+    df.to_csv(
+        csv_name,
+        index=False,
+        encoding="utf-8-sig",
+        sep=";",
+        quoting=csv.QUOTE_NONNUMERIC,
+        lineterminator="\n",
+    )
+    print(f"\n📊 БОМБА! Итоговая таблица создана: {csv_name}")
 
 async def main_cli():
     parser = argparse.ArgumentParser(description="Szwego Pipeline CLI")
     parser.add_argument("--all", action="store_true", help="Парсить весь каталог")
     parser.add_argument("--limit", type=int, help="Переопределить лимит количества товаров")
     parser.add_argument("--single", action="store_true", help="Парсить один товар по ссылке")
-    parser.add_argument("--build-table", action="store_true", help="Собрать накопленные товары в Excel через ИИ")
+    parser.add_argument("--build-table", action="store_true", help="Собрать накопленные товары в CSV через ИИ")
     
     args = parser.parse_args()
 
@@ -786,7 +813,7 @@ async def main_cli():
         print(f"📂 Загружено {len(raw_selected_items)} товаров из поштучного списка черновиков.")
         await process_and_export_table(raw_selected_items)
         
-        # По желанию: очищаем файл-черновик после успешного экспорта в Excel
+        # По желанию: очищаем файл-черновик после успешного экспорта в CSV
         try:
             os.remove(RAW_DUMP_FILE)
             print(f"🧹 Черновик {RAW_DUMP_FILE} успешно очищен.")
