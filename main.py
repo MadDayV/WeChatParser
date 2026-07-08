@@ -665,7 +665,7 @@ async def run_single_mode(url: str):
         print("❌ Не удалось получить данные товара.")
 
 def format_card_for_export(card_data: dict) -> dict:
-    """Подготавливает строку для CSV: пустой sku, теги через запятую, одна строка на товар."""
+    """Подготавливает строку для CSV: пустой sku и теги через запятую."""
     row = dict(card_data)
     sku = str(row.get("sku", "")).strip()
     if not sku or sku.upper() == "N/A":
@@ -677,9 +677,6 @@ def format_card_for_export(card_data: dict) -> dict:
         row["tags"] = ""
     else:
         row["tags"] = str(tags).strip()
-    for field in ("description_ru", "title_ru", "title_ru_short"):
-        if field in row and row[field]:
-            row[field] = re.sub(r"\s*\n\s*", " ", str(row[field])).strip()
     return row
 
 async def process_and_export_table(raw_items: list):
