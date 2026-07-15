@@ -1,5 +1,4 @@
 import asyncio
-import csv
 import json
 import time
 import os
@@ -10,7 +9,6 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from dotenv import load_dotenv
 import sys
 import argparse
-import pandas as pd
 from datetime import datetime
 import logging
 
@@ -138,8 +136,8 @@ class ProductCard(BaseModel):
         data.setdefault("title_ru", title)
         data.setdefault("description_ru", data.get("description") or "")
         data.setdefault("brand", "Премиальный бренд")
-        data.setdefault("sku", "N/A")
-        data.setdefault("category", "Одежда и Аксессуары")
+        data.setdefault("sku", "")
+        data.setdefault("category", "")
         data.setdefault("tags", [])
 
         return data
@@ -155,23 +153,35 @@ class ProductCard(BaseModel):
             return [str(tag).strip() for tag in value if str(tag).strip()]
         return []
 
-    @field_validator("sku", "category", "brand", mode="before")
+    @field_validator("sku", "brand", mode="before")
     @classmethod
     def coerce_required_strings(cls, value: Any) -> str:
         if value is None:
             return ""
-        return str(value).strip()
+        text = str(value).strip()
+        if text.upper() == "N/A":
+            return ""
+        return text
+
+    @field_validator("category", mode="before")
+    @classmethod
+    def coerce_category(cls, value: Any) -> str:
+        if value is None:
+            return ""
+        return normalize_category_path(str(value).strip())
 
     @model_validator(mode="after")
     def fill_empty_strings(self) -> "ProductCard":
-        if not self.sku:
-            object.__setattr__(self, "sku", "N/A")
-        if not self.category:
-            object.__setattr__(self, "category", "Одежда и Аксессуары")
+        # sku: пустое поле, если артикул не найден (не N/A)
+        if self.sku and self.sku.upper() == "N/A":
+            object.__setattr__(self, "sku", "")
         if not self.brand:
-            object.__setattr__(self, "brand", "Премиальный бренд")
+            object.__setattr__(self, "brand", "Неизвестный производитель")
         if not self.tags:
-            fallback_tags = [tag for tag in (self.brand, self.category) if tag and tag not in ("N/A", "Одежда и Аксессуары", "Премиальный бренд")]
+            fallback_tags = [
+                tag for tag in (self.brand, self.category)
+                if tag and tag not in ("Неизвестный производитель",)
+            ]
             object.__setattr__(self, "tags", fallback_tags or ["lux"])
         return self
 
@@ -262,17 +272,16 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
                     "X-Title": "Szwego AI Parser"
                 }
 
-                # Пример показывает ТОЛЬКО формат ключей и HTML-разметку.
-                # Значение sku здесь специально "N/A", чтобы модель не копировала чужой артикул.
+                # Пример показывает ТОЛЬКО формат ключей. sku пустой; category — полный путь из дерева.
                 json_example = (
                     "{\n"
-                    '  "title_ru_short": "Сумка женская через плечо - Louis Vuitton - Speedy P9",\n'
+                    '  "title_ru_short": "Сумка Louis Vuitton Speedy P9",\n'
                     '  "title_ru": "Сумка Louis Vuitton Speedy P9 Bandoulière 25",\n'
                     '  "brand": "Louis Vuitton",\n'
-                    '  "sku": "N/A",\n'
-                    '  "description_ru": "Сумка Louis Vuitton Speedy P9 — это ультрасовременное переосмысление культового силуэта. Модель выполнена из мягкой кожи теленка премиум-качества.\\n\\n<h3>Особенности модели</h3>\\n• <strong>Эксклюзивный принт:</strong> Монограмма нанесена методом высокоточной печати.\\n• <strong>Внимание к деталям:</strong> Вся фурнитура покрыта золотым напылением.",\n'
-                    '  "category": "Сумки",\n'
-                    '  "tags": ["Louis Vuitton", "Speedy", "Сумка"]\n'
+                    '  "sku": "",\n'
+                    '  "description_ru": "<p><strong>Сумка Louis Vuitton Speedy P9</strong> — ультрасовременное переосмысление культового силуэта.</p>\\n\\n<h3>ДНК изделия</h3>\\n<p>Модель выполнена из мягкой кожи теленка премиум-качества.</p>",\n'
+                    '  "category": "Женский > Аксессуары > Сумки и рюкзаки > Через плечо",\n'
+                    '  "tags": ["Сумка", "Louis Vuitton", "Speedy P9"]\n'
                     "}"
                 )
 
@@ -284,10 +293,11 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
                     f"2. Все ключи в JSON должны быть плоскими (без вложений).\n"
                     f"3. Поле tags — только JSON-массив строк, не строка через запятую.\n"
                     f"4. Поля sku и category всегда строки.\n"
-                    f"5. АРТИКУЛ (sku): бери ТОЛЬКО реальный код модели из текста поставщика выше. "
-                    f"ЗАПРЕЩЕНО придумывать артикул, брать его из примера в этой инструкции "
-                    f"(значение \"N/A\" в примере — это НЕ артикул товара) или использовать ID/ссылку Szwego. "
-                    f"Если в тексте поставщика нет явного артикула — пиши строго sku: \"N/A\"."
+                    f"5. АРТИКУЛ (sku): если нет подтверждённого оригинального артикула — пиши строго пустую строку \"\". "
+                    f"ЗАПРЕЩЕНО писать N/A, выдумывать код или копировать его из примера.\n"
+                    f"6. КАТЕГОРИЯ (category): ТОЛЬКО полный путь из дерева категорий промпта, "
+                    f"например \"Женский > Аксессуары > Сумки и рюкзаки > Через плечо\". "
+                    f"ЗАПРЕЩЕНО короткие названия вроде \"Сумки\", \"Обувь\", \"Одежда и Аксессуары\"."
                 )
 
                 payload = {
@@ -664,8 +674,159 @@ async def run_single_mode(url: str):
     else:
         print("❌ Не удалось получить данные товара.")
 
+# Разрешённые пути категорий строго по дереву из ai_prompt.txt
+_CATEGORY_LEAVES = [
+    "Одежда > Верхняя одежда > Ветровки",
+    "Одежда > Верхняя одежда > Пуховики",
+    "Одежда > Верхняя одежда > Пальто",
+    "Одежда > Верхняя одежда > Кожаные куртки",
+    "Одежда > Верхняя одежда > Джуты",
+    "Одежда > Верхняя одежда > Жилеты",
+    "Одежда > Верхняя одежда > Шубы",
+    "Одежда > Худи > На замке",
+    "Одежда > Худи > Без замка",
+    "Одежда > Свитшоты",
+    "Одежда > Брюки > Повседневные",
+    "Одежда > Брюки > Классические",
+    "Одежда > Брюки > Спортивные брюки",
+    "Одежда > Шорты",
+    "Одежда > Плавки и купальники > Плавки",
+    "Одежда > Плавки и купальники > Купальники",
+    "Одежда > Футболки, майки, топы > Футболки",
+    "Одежда > Футболки, майки, топы > Поло",
+    "Одежда > Футболки, майки, топы > Майки",
+    "Одежда > Футболки, майки, топы > Топы",
+    "Одежда > Лонгсливы",
+    "Одежда > Рубашки и блузки > Длинный рукав",
+    "Одежда > Рубашки и блузки > Короткий рукав",
+    "Одежда > Свитеры",
+    "Одежда > Джинсы",
+    "Одежда > Платья",
+    "Одежда > Юбки",
+    "Обувь > Кроссовки",
+    "Обувь > Кеды",
+    "Обувь > Лоферы",
+    "Обувь > Мюли",
+    "Обувь > Ботинки",
+    "Обувь > Мокасины",
+    "Обувь > Сандалии",
+    "Обувь > Туфли",
+    "Обувь > Шлепанцы",
+    "Обувь > Сапоги",
+    "Обувь > Балетки",
+    "Обувь > Ботильоны",
+    "Обувь > Босоножки",
+    "Аксессуары > Сумки и рюкзаки > Через плечо",
+    "Аксессуары > Сумки и рюкзаки > Поясные",
+    "Аксессуары > Сумки и рюкзаки > Барсетки",
+    "Аксессуары > Сумки и рюкзаки > Мессенджеры",
+    "Аксессуары > Сумки и рюкзаки > Дорожные и чемоданы",
+    "Аксессуары > Сумки и рюкзаки > Рюкзаки",
+    "Аксессуары > Сумки и рюкзаки > Клатчи",
+    "Аксессуары > Сумки и рюкзаки > Косметички",
+    "Аксессуары > Кошельки > Кошельки",
+    "Аксессуары > Кошельки > Картхолдеры",
+    "Аксессуары > Кошельки > Визитницы",
+    "Аксессуары > Часы",
+    "Аксессуары > Ремни",
+    "Аксессуары > Очки",
+    "Аксессуары > Головные уборы > Кепки",
+    "Аксессуары > Головные уборы > Панамы",
+    "Аксессуары > Головные уборы > Шапки",
+    "Аксессуары > Головные уборы > Шляпы",
+]
+_CATEGORY_GENDERS = ("Мужской", "Женский", "Унисекс")
+ALLOWED_CATEGORIES = {
+    f"{gender} > {leaf}"
+    for gender in _CATEGORY_GENDERS
+    for leaf in _CATEGORY_LEAVES
+}
+
+# Короткие/устаревшие названия → ближайший путь из дерева (пол уточняется отдельно)
+_CATEGORY_ALIASES = {
+    "сумки": "Аксессуары > Сумки и рюкзаки > Через плечо",
+    "сумка": "Аксессуары > Сумки и рюкзаки > Через плечо",
+    "рюкзаки": "Аксессуары > Сумки и рюкзаки > Рюкзаки",
+    "кошельки": "Аксессуары > Кошельки > Кошельки",
+    "портмоне": "Аксессуары > Кошельки > Кошельки",
+    "карты": "Аксессуары > Кошельки > Картхолдеры",
+    "картхолдер": "Аксессуары > Кошельки > Картхолдеры",
+    "часы": "Аксессуары > Часы",
+    "ремни": "Аксессуары > Ремни",
+    "очки": "Аксессуары > Очки",
+    "обувь": "Обувь > Кеды",
+    "кроссовки": "Обувь > Кроссовки",
+    "кеды": "Обувь > Кеды",
+    "лоферы": "Обувь > Лоферы",
+    "мюли": "Обувь > Мюли",
+    "ботинки": "Обувь > Ботинки",
+    "туфли": "Обувь > Туфли",
+    "шлепанцы": "Обувь > Шлепанцы",
+    "сандалии": "Обувь > Сандалии",
+    "одежда и аксессуары": "Одежда > Футболки, майки, топы > Футболки",
+    "худи": "Одежда > Худи > Без замка",
+    "свитшот": "Одежда > Свитшоты",
+    "свитер": "Одежда > Свитеры",
+    "кардиган": "Одежда > Свитеры",
+    "джемпер": "Одежда > Свитеры",
+    "водолазка": "Одежда > Свитеры",
+    "футболка": "Одежда > Футболки, майки, топы > Футболки",
+    "поло": "Одежда > Футболки, майки, топы > Поло",
+    "джинсы": "Одежда > Джинсы",
+    "платье": "Одежда > Платья",
+    "юбка": "Одежда > Юбки",
+}
+
+
+def normalize_category_path(value: str) -> str:
+    """Нормализует путь категории и приводит его к дереву из промпта."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+
+    cleaned = re.sub(r"\s*[>/→\-–—]+\s*", " > ", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" >")
+    parts = [p.strip() for p in cleaned.split(" > ") if p.strip()]
+
+    gender = "Унисекс"
+    leaf_parts = parts
+    if parts and parts[0] in _CATEGORY_GENDERS:
+        gender = parts[0]
+        leaf_parts = parts[1:]
+    elif "женщин" in cleaned.lower() or "женск" in cleaned.lower():
+        gender = "Женский"
+    elif "мужчин" in cleaned.lower() or "мужск" in cleaned.lower():
+        gender = "Мужской"
+
+    leaf = " > ".join(leaf_parts).strip()
+    candidate = f"{gender} > {leaf}" if leaf else ""
+    if candidate in ALLOWED_CATEGORIES:
+        return candidate
+
+    # Точное совпадение листа без пола
+    for allowed_leaf in _CATEGORY_LEAVES:
+        if leaf.lower() == allowed_leaf.lower():
+            return f"{gender} > {allowed_leaf}"
+
+    # Алиасы коротких названий
+    compact = leaf.lower() if leaf else cleaned.lower()
+    for alias, mapped_leaf in _CATEGORY_ALIASES.items():
+        if alias in compact:
+            return f"{gender} > {mapped_leaf}"
+
+    # Частичное совпадение по последнему сегменту (Кроссовки, Через плечо, ...)
+    last = (leaf_parts[-1] if leaf_parts else cleaned).lower()
+    for allowed_leaf in _CATEGORY_LEAVES:
+        if allowed_leaf.split(" > ")[-1].lower() == last:
+            return f"{gender} > {allowed_leaf}"
+        if last in allowed_leaf.lower():
+            return f"{gender} > {allowed_leaf}"
+
+    return ""
+
+
 def format_card_for_export(card_data: dict) -> dict:
-    """Подготавливает строку для CSV: пустой sku и теги через запятую."""
+    """Подготавливает строку для экспорта: пустой sku, теги через запятую, абзацы в description сохраняются."""
     row = dict(card_data)
     sku = str(row.get("sku", "")).strip()
     if not sku or sku.upper() == "N/A":
@@ -677,7 +838,48 @@ def format_card_for_export(card_data: dict) -> dict:
         row["tags"] = ""
     else:
         row["tags"] = str(tags).strip()
+
+    normalized = normalize_category_path(str(row.get("category", "")))
+    if normalized:
+        row["category"] = normalized
     return row
+
+
+def export_products_table(export_rows: list) -> str:
+    """
+    Пишет xlsx: абзацы (\\n) внутри ячейки description сохраняются,
+    но Wrap Text выключен — строки не растягиваются при просмотре в Excel.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment
+
+    if not export_rows:
+        raise ValueError("Нет строк для экспорта")
+
+    columns = list(export_rows[0].keys())
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "products"
+
+    # Заголовки
+    for col_idx, header in enumerate(columns, 1):
+        cell = ws.cell(row=1, column=col_idx, value=header)
+        cell.alignment = Alignment(wrap_text=False, vertical="center")
+
+    # Данные
+    for row_idx, row in enumerate(export_rows, 2):
+        for col_idx, header in enumerate(columns, 1):
+            value = row.get(header, "")
+            if value is None:
+                value = ""
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
+            # Переносы внутри значения остаются, визуальный wrap в Excel — выключен
+            cell.alignment = Alignment(wrap_text=False, vertical="center")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    excel_name = f"products_export_{timestamp}.xlsx"
+    wb.save(excel_name)
+    return excel_name
 
 async def process_and_export_table(raw_items: list):
     """Принимает список сырых товаров, прогоняет через ИИ и делает экспорт"""
@@ -756,26 +958,15 @@ async def process_and_export_table(raw_items: list):
         json.dump(final_cards, f, ensure_ascii=False, indent=4)
 
     export_rows = [format_card_for_export(card) for card in final_cards]
-    df = pd.DataFrame(export_rows)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_name = f"products_export_{timestamp}.csv"
-    
-    df.to_csv(
-        csv_name,
-        index=False,
-        encoding="utf-8-sig",
-        sep=";",
-        quoting=csv.QUOTE_NONNUMERIC,
-        lineterminator="\n",
-    )
-    print(f"\n📊 БОМБА! Итоговая таблица создана: {csv_name}")
+    excel_name = export_products_table(export_rows)
+    print(f"\n📊 БОМБА! Итоговая таблица создана: {excel_name}")
 
 async def main_cli():
     parser = argparse.ArgumentParser(description="Szwego Pipeline CLI")
     parser.add_argument("--all", action="store_true", help="Парсить весь каталог")
     parser.add_argument("--limit", type=int, help="Переопределить лимит количества товаров")
     parser.add_argument("--single", action="store_true", help="Парсить один товар по ссылке")
-    parser.add_argument("--build-table", action="store_true", help="Собрать накопленные товары в CSV через ИИ")
+    parser.add_argument("--build-table", action="store_true", help="Собрать накопленные товары в Excel через ИИ")
     
     args = parser.parse_args()
 
@@ -810,7 +1001,7 @@ async def main_cli():
         print(f"📂 Загружено {len(raw_selected_items)} товаров из поштучного списка черновиков.")
         await process_and_export_table(raw_selected_items)
         
-        # По желанию: очищаем файл-черновик после успешного экспорта в CSV
+        # По желанию: очищаем файл-черновик после успешного экспорта в Excel
         try:
             os.remove(RAW_DUMP_FILE)
             print(f"🧹 Черновик {RAW_DUMP_FILE} успешно очищен.")
