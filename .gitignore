@@ -3,8 +3,11 @@
 __pycache__/
 *.xlsx
 *.csv
+failed_products_*.json
+failed_raw_products_*.json
 raw_selected_products.json
 .idea/
 .vscode/
 debug.txt
+final_products.json
 final_products.json

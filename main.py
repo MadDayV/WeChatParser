@@ -202,6 +202,102 @@ COOKIES = {
     'token': SZWEGO_TOKEN
 }
 
+def extract_json_object(text: str) -> str:
+    """Вырезает первый JSON-объект из ответа ИИ (без markdown)."""
+    cleaned = text.replace("```json", "").replace("```", "").strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("В ответе ИИ не найден JSON-объект {...}")
+    return cleaned[start : end + 1]
+
+
+def repair_json_control_chars(text: str) -> str:
+    """
+    Чинит типичные поломки JSON от LLM:
+    - сырые переносы строк внутри кавычек (Invalid control character)
+    - битые escape-последовательности (Invalid \\escape)
+    """
+    result: List[str] = []
+    in_string = False
+    i = 0
+    n = len(text)
+
+    while i < n:
+        ch = text[i]
+
+        if not in_string:
+            if ch == '"':
+                in_string = True
+            result.append(ch)
+            i += 1
+            continue
+
+        # внутри строки
+        if ch == "\\":
+            nxt = text[i + 1] if i + 1 < n else ""
+            if nxt in '"\\/bfnrt':
+                result.append(ch)
+                result.append(nxt)
+                i += 2
+                continue
+            if nxt == "u" and i + 5 < n and all(
+                c in "0123456789abcdefABCDEF" for c in text[i + 2 : i + 6]
+            ):
+                result.append(text[i : i + 6])
+                i += 6
+                continue
+            # Битый escape: экранируем сам слэш
+            result.append("\\\\")
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = False
+            result.append(ch)
+            i += 1
+            continue
+
+        if ch == "\n":
+            result.append("\\n")
+            i += 1
+            continue
+        if ch == "\r":
+            result.append("\\r")
+            i += 1
+            continue
+        if ch == "\t":
+            result.append("\\t")
+            i += 1
+            continue
+        if ord(ch) < 32:
+            result.append(f"\\u{ord(ch):04x}")
+            i += 1
+            continue
+
+        result.append(ch)
+        i += 1
+
+    return "".join(result)
+
+
+def parse_ai_json_payload(raw_text: str) -> dict:
+    """Парсит ответ ИИ в dict: сначала напрямую, при ошибке — с починкой."""
+    candidate = extract_json_object(raw_text)
+
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        repaired = repair_json_control_chars(candidate)
+        parsed = json.loads(repaired)
+
+    if isinstance(parsed, dict) and "product_card" in parsed and isinstance(parsed["product_card"], dict):
+        return parsed["product_card"]
+    if isinstance(parsed, dict):
+        return parsed
+    raise ValueError("Ответ ИИ не является JSON-объектом")
+
+
 async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[ProductCard]:
     if not raw_text or not raw_text.strip():
         return None
@@ -262,9 +358,6 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
                 return response.choices[0].message.parsed
             
             elif AI_PROVIDER == "openrouter":
-                import httpx
-                import json
-                
                 headers = {
                     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                     "Content-Type": "application/json",
@@ -297,19 +390,22 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
                     f"ЗАПРЕЩЕНО писать N/A, выдумывать код или копировать его из примера.\n"
                     f"6. КАТЕГОРИЯ (category): ТОЛЬКО полный путь из дерева категорий промпта, "
                     f"например \"Женский > Аксессуары > Сумки и рюкзаки > Через плечо\". "
-                    f"ЗАПРЕЩЕНО короткие названия вроде \"Сумки\", \"Обувь\", \"Одежда и Аксессуары\"."
+                    f"ЗАПРЕЩЕНО короткие названия вроде \"Сумки\", \"Обувь\", \"Одежда и Аксессуары\".\n"
+                    f"7. В description_ru переносы строк пиши ТОЛЬКО как экранированные \\n внутри JSON-строки. "
+                    f"Нельзя вставлять реальные переносы строк внутри кавычек JSON."
                 )
 
                 payload = {
                     "model": OPENROUTER_MODEL,
                     "messages": [
-                        {"role": "system", "content": mcp_system_content},  # <-- Просто передаем переменную
+                        {"role": "system", "content": mcp_system_content},
                         {"role": "user", "content": user_prompt}
                     ],
-                    "temperature": AI_TEMPERATURE
+                    "temperature": AI_TEMPERATURE,
+                    "response_format": {"type": "json_object"},
                 }
                 
-                async with httpx.AsyncClient(timeout=45.0) as client:
+                async with httpx.AsyncClient(timeout=90.0) as client:
                     res = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
                     
                     # Если OpenRouter вернул ошибку, мы выведем её ТЕКСТ в консоль, а не упадем
@@ -318,15 +414,7 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
                         
                     data = res.json()
                     raw_json_text = data["choices"][0]["message"]["content"]
-                    
-                    # Чистим от возможных markdown тегов ИИ
-                    raw_json_text = raw_json_text.replace("```json", "").replace("```", "").strip()
-                    
-                    # Наш QA-хак очистки обертки
-                    parsed_dict = json.loads(raw_json_text)
-                    if "product_card" in parsed_dict:
-                        parsed_dict = parsed_dict["product_card"]
-                        
+                    parsed_dict = parse_ai_json_payload(raw_json_text)
                     return ProductCard.model_validate(parsed_dict)
                 
         except Exception as e:
@@ -889,6 +977,8 @@ async def process_and_export_table(raw_items: list):
 
     print(f"🤖 Запуск пакетной генерации для {len(raw_items)} товаров...")
     final_cards = []
+    failed_items = []
+    failed_raw_items = []
 
     for idx, item in enumerate(raw_items, 1):
         # === ОБНОВЛЕННЫЙ СБОР ТЕКСТА ПОД КОНТРАКТ COMMODITY ===
@@ -924,9 +1014,6 @@ async def process_and_export_table(raw_items: list):
         if ai_card:
             card_data = ai_card.model_dump() if hasattr(ai_card, 'model_dump') else ai_card
             card_data['szwego_id'] = item_id
-        
-        if ai_card:
-            card_data = ai_card.model_dump() if hasattr(ai_card, 'model_dump') else ai_card
             
             # --- ИСПРАВЛЕННЫЙ БЛОК СБОРА ИЗОБРАЖЕНИЙ ПО СКРИНШОТУ DEVTOOLS ---
             img_urls = []
@@ -947,9 +1034,29 @@ async def process_and_export_table(raw_items: list):
             # Записываем ссылки на фото через запятую в финальную карточку
             card_data['original_imgs'] = ", ".join(img_urls) if isinstance(img_urls, list) else str(img_urls)
             final_cards.append(card_data)
+            print(f" -> [OK] {card_data.get('title_ru', '')} (SKU: {card_data.get('sku', '')})")
         else:
-            print(f"⚠️ [SKIP] Ошибка генерации для товара ID: {item.get('id')}")
+            failed_items.append({
+                "szwego_id": str(item_id),
+                "title": str(title)[:200],
+                "reason": "ИИ не вернул валидный JSON после 3 попыток",
+            })
+            failed_raw_items.append(item)
+            print(f"⚠️ [SKIP] Ошибка генерации для товара ID: {item_id}")
             
+    if failed_items:
+        fail_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        failed_report = f"failed_products_{fail_stamp}.json"
+        failed_raw_file = f"failed_raw_products_{fail_stamp}.json"
+        with open(failed_report, "w", encoding="utf-8") as f:
+            json.dump(failed_items, f, ensure_ascii=False, indent=2)
+        with open(failed_raw_file, "w", encoding="utf-8") as f:
+            json.dump(failed_raw_items, f, ensure_ascii=False, indent=2)
+        print(f"\n⚠️ Не сгенерировано товаров: {len(failed_items)} из {len(raw_items)}")
+        print(f"   Список ID/названий: {failed_report}")
+        print(f"   Сырые данные для повтора: {failed_raw_file}")
+        print("   Чтобы перегенерировать только их: скопируйте файл в raw_selected_products.json и снова пункт 4.")
+
     if not final_cards:
         print("❌ Ни один товар не был успешно обработан.")
         return
@@ -960,6 +1067,7 @@ async def process_and_export_table(raw_items: list):
     export_rows = [format_card_for_export(card) for card in final_cards]
     excel_name = export_products_table(export_rows)
     print(f"\n📊 БОМБА! Итоговая таблица создана: {excel_name}")
+    print(f"   Успешно: {len(final_cards)} | Ошибки: {len(failed_items)}")
 
 async def main_cli():
     parser = argparse.ArgumentParser(description="Szwego Pipeline CLI")
