@@ -715,52 +715,186 @@ async def fetch_single_item_raw_url(original_url: str) -> Dict[str, Any]:
         print(f"\n❌ Ошибка сети при поштучном запросе: {e}")
         return {}
 
+def load_raw_dump() -> list:
+    """Читает черновик поштучного сбора; при ошибке/отсутствии — пустой список."""
+    if not os.path.exists(RAW_DUMP_FILE):
+        return []
+    try:
+        with open(RAW_DUMP_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_raw_dump(data: list) -> None:
+    """Перезаписывает черновик поштучного сбора."""
+    with open(RAW_DUMP_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+
+def _normalize_img_list(img_urls) -> List[str]:
+    """Приводит imgsSrc/imgs к списку строковых URL."""
+    if not img_urls:
+        return []
+    if not isinstance(img_urls, list):
+        return [str(img_urls)]
+    if img_urls and isinstance(img_urls[0], dict):
+        return [
+            str(img.get("url") or img.get("thumb") or "").strip()
+            for img in img_urls
+            if img.get("url") or img.get("thumb")
+        ]
+    return [str(u).strip() for u in img_urls if str(u).strip()]
+
+
+def extract_image_urls(item: dict) -> List[str]:
+    """Достаёт URL фото из сырого товара (commodity или плоская структура)."""
+    if not isinstance(item, dict):
+        return []
+
+    img_urls = []
+    if "commodity" in item and isinstance(item["commodity"], dict):
+        commodity_data = item["commodity"]
+        img_urls = commodity_data.get("imgsSrc") or commodity_data.get("imgs") or []
+
+    if not img_urls:
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        commodity_nested = result.get("commodity") if isinstance(result.get("commodity"), dict) else {}
+        if commodity_nested:
+            img_urls = commodity_nested.get("imgsSrc") or commodity_nested.get("imgs") or []
+
+    if not img_urls:
+        img_urls = item.get("imgsSrc") or item.get("imgs") or item.get("image_list") or item.get("img_list") or []
+
+    return _normalize_img_list(img_urls)
+
+
+def set_image_urls(item: dict, urls: List[str]) -> None:
+    """Записывает список фото в сырой товар (commodity.imgsSrc или плоский imgsSrc)."""
+    if "commodity" in item and isinstance(item["commodity"], dict):
+        item["commodity"]["imgsSrc"] = list(urls)
+        return
+    result = item.get("result") if isinstance(item.get("result"), dict) else None
+    if result and isinstance(result.get("commodity"), dict):
+        result["commodity"]["imgsSrc"] = list(urls)
+        return
+    item["imgsSrc"] = list(urls)
+
+
+def resolve_item_id(item: dict, idx: int = 1) -> str:
+    """Единый способ достать szwego/goods id из сырой записи."""
+    commodity_block = {}
+    if isinstance(item, dict):
+        commodity_block = item.get("commodity") or {}
+        if not commodity_block:
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            commodity_block = result.get("commodity") if isinstance(result.get("commodity"), dict) else {}
+    return str(
+        item.get("goods_id")
+        or item.get("id")
+        or item.get("itemId")
+        or (commodity_block.get("goods_id") if isinstance(commodity_block, dict) else None)
+        or (commodity_block.get("id") if isinstance(commodity_block, dict) else None)
+        or f"unknown_{idx}"
+    )
+
+
 def save_to_raw_dump(item_data: dict, original_url: str):
     """Сохраняет сырой товар в черновик json-файла (накопительный режим)"""
-    data = []
-    if os.path.exists(RAW_DUMP_FILE):
-        try:
-            with open(RAW_DUMP_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = []
-            
+    data = load_raw_dump()
+
     # Защита: вытаскиваем уникальный ID товара из самой ссылки Павла, если API его не вернуло
     item_id_match = re.search(r"(?:theme_detail|goods_detail)/[^/]+/([^/?#]+)", original_url)
     fallback_id = item_id_match.group(1) if item_id_match else f"id_{int(time.time()*1000)}"
-    
+
     current_id = item_data.get("id") or item_data.get("itemId") or fallback_id
     item_data["id"] = current_id  # Гарантируем наличие ключа id для всей системы
 
-    # Проверка на реальные дубликаты
-    if not any(str(x.get("id")) == str(current_id) for x in data):
-        data.append(item_data)
-        with open(RAW_DUMP_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
-        print(f"✅ Товар добавлен в черновик (Всего в списке: {len(data)}).")
-    else:
+    if any(str(x.get("id")) == str(current_id) for x in data):
         print("ℹ️ Этот товар уже есть в списке черновиков.")
-    # Проверка на дубликаты, чтобы не добавлять один товар дважды
-    if not any(x.get("id") == item_data.get("id") for x in data):
-        data.append(item_data)
-        with open(RAW_DUMP_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
-        print(f"✅ Товар '{item_data.get('title', 'Без названия')}' добавлен в черновик (Всего: {len(data)}).")
-    else:
-        print("ℹ️ Этот товар уже есть в списке черновиков.")
+        return
+
+    data.append(item_data)
+    save_raw_dump(data)
+    print(f"✅ Товар добавлен в черновик (Всего в списке: {len(data)}).")
+
 
 async def run_single_mode(url: str):
     """Точка входа для поштучного режима"""
     if not url.startswith("http"):
         print("❌ Строка не похожа на ссылку! Проверьте ввод.")
         return
-        
+
     item_data = await fetch_single_item_raw_url(url)
     if item_data:
         # Передаем url аргументом для генерации fallback_id
         save_to_raw_dump(item_data, url)
     else:
         print("❌ Не удалось получить данные товара.")
+
+
+async def run_append_link_mode():
+    """П.3: докинуть фото с другой ссылки в последний товар черновика."""
+    data = load_raw_dump()
+    if not data:
+        print("❌ Черновик пуст. Сначала добавьте товар пунктом 1.")
+        return
+
+    url = input("👉 Вставьте ссылку с доп. фото для ПОСЛЕДНЕГО товара: ").strip()
+    if not url.startswith("http"):
+        print("❌ Строка не похожа на ссылку! Проверьте ввод.")
+        return
+
+    new_item = await fetch_single_item_raw_url(url)
+    if not new_item:
+        print("❌ Не удалось получить данные по ссылке.")
+        return
+
+    target = data[-1]
+    existing = extract_image_urls(target)
+    incoming = extract_image_urls(new_item)
+
+    seen = set(existing)
+    added = []
+    for img_url in incoming:
+        if img_url and img_url not in seen:
+            seen.add(img_url)
+            added.append(img_url)
+
+    if not added:
+        print("ℹ️ Новых фото не найдено (все уже есть в последнем товаре).")
+        return
+
+    merged = existing + added
+    set_image_urls(target, merged)
+    save_raw_dump(data)
+    print(
+        f"✅ К последнему товару добавлено фото: {len(added)}. "
+        f"Всего фото: {len(merged)}. Товаров в черновике: {len(data)}."
+    )
+
+
+async def run_set_manual_meta_mode():
+    """П.4: вручную задать короткое название и бренд для последнего товара (без ИИ при экспорте)."""
+    data = load_raw_dump()
+    if not data:
+        print("❌ Черновик пуст. Сначала добавьте товар пунктом 1.")
+        return
+
+    title = input("👉 Короткое название товара: ").strip()
+    brand = input("👉 Бренд: ").strip()
+    if not title or not brand:
+        print("❌ Нужны и название, и бренд. Повторите пункт 4.")
+        return
+
+    target = data[-1]
+    target["_manual_export"] = True
+    target["_manual_title_ru_short"] = title
+    target["_manual_brand"] = brand
+    save_raw_dump(data)
+    print(f"✅ Для последнего товара записано вручную: «{title}» / {brand}")
+    print("   При сборке таблицы этот товар уйдёт без ИИ.")
 
 # Разрешённые пути категорий строго по дереву из ai_prompt.txt
 _CATEGORY_LEAVES = [
@@ -970,12 +1104,12 @@ def export_products_table(export_rows: list) -> str:
     return excel_name
 
 async def process_and_export_table(raw_items: list):
-    """Принимает список сырых товаров, прогоняет через ИИ и делает экспорт"""
+    """Принимает список сырых товаров, прогоняет через ИИ (или manual) и делает экспорт"""
     if not raw_items:
-        print("❌ Нет данных для обработки ИИ!")
+        print("❌ Нет данных для обработки!")
         return
 
-    print(f"🤖 Запуск пакетной генерации для {len(raw_items)} товаров...")
+    print(f"🤖 Запуск пакетной обработки для {len(raw_items)} товаров...")
     final_cards = []
     failed_items = []
     failed_raw_items = []
@@ -984,7 +1118,7 @@ async def process_and_export_table(raw_items: list):
         # === ОБНОВЛЕННЫЙ СБОР ТЕКСТА ПОД КОНТРАКТ COMMODITY ===
         # 1. Проверяем вложенную структуру (result -> commodity)
         commodity_block = item.get('commodity', item.get('result', {}).get('commodity', {})) if isinstance(item, dict) else {}
-        
+
         # 2. Извлекаем заголовок и описание с учетом вложенности
         if commodity_block:
             title = commodity_block.get('title', '')
@@ -993,20 +1127,43 @@ async def process_and_export_table(raw_items: list):
             # Резервный вариант для старой плоской структуры
             title = item.get('title', item.get('theme_name', ''))
             desc = item.get('description', item.get('content', ''))
-            
+
+        item_id = resolve_item_id(item, idx)
+        img_urls = extract_image_urls(item)
+        original_imgs = ", ".join(img_urls) if img_urls else ""
+
+        # Ручной режим: название/бренд от заказчика, без ИИ
+        if item.get("_manual_export"):
+            manual_title = str(item.get("_manual_title_ru_short") or "").strip()
+            manual_brand = str(item.get("_manual_brand") or "").strip()
+            print(f" ✍️ [{idx}/{len(raw_items)}] Ручной товар ID: {item_id}...")
+            if not manual_title or not manual_brand:
+                failed_items.append({
+                    "szwego_id": str(item_id),
+                    "title": str(title)[:200],
+                    "reason": "Ручной режим: не заданы название и/или бренд",
+                })
+                failed_raw_items.append(item)
+                print(f"⚠️ [SKIP] Ручной товар без названия/бренда ID: {item_id}")
+                continue
+
+            card_data = {
+                "title_ru_short": manual_title,
+                "title_ru": manual_title,
+                "brand": manual_brand,
+                "sku": "",
+                "description_ru": "",
+                "category": "",
+                "tags": [],
+                "szwego_id": item_id,
+                "original_imgs": original_imgs,
+            }
+            final_cards.append(card_data)
+            print(f" -> [OK MANUAL] {manual_title} / {manual_brand}")
+            continue
+
         # 3. Собираем финальный текст для отправки в OpenRouter
         raw_text = f"Заголовок: {title}\nОписание: {desc}"
-
-        # === ИСПРАВЛЕННЫЙ БЛОК: Сбор ID под обе структуры Szwego ===
-        item_id = (
-            item.get('goods_id') or 
-            item.get('id') or 
-            item.get('itemId') or 
-            (commodity_block.get('goods_id') if isinstance(commodity_block, dict) else None) or
-            (commodity_block.get('id') if isinstance(commodity_block, dict) else None) or
-            f"unknown_{idx}"
-        )
-        # ==========================================================
 
         print(f" 🤖 [{idx}/{len(raw_items)}] Обработка товара ID: {item_id}...")
         ai_card = await generate_ai_card(raw_text)
@@ -1014,25 +1171,7 @@ async def process_and_export_table(raw_items: list):
         if ai_card:
             card_data = ai_card.model_dump() if hasattr(ai_card, 'model_dump') else ai_card
             card_data['szwego_id'] = item_id
-            
-            # --- ИСПРАВЛЕННЫЙ БЛОК СБОРА ИЗОБРАЖЕНИЙ ПО СКРИНШОТУ DEVTOOLS ---
-            img_urls = []
-            
-            # 1. Проверяем поштучный режим (result -> commodity -> imgsSrc)
-            if "commodity" in item and isinstance(item["commodity"], dict):
-                commodity_data = item["commodity"]
-                img_urls = commodity_data.get("imgsSrc") or commodity_data.get("imgs") or []
-            
-            # 2. Если структура плоская (как в режиме полного парсинга альбома)
-            if not img_urls:
-                img_urls = item.get("imgsSrc") or item.get("imgs") or item.get("image_list") or item.get("img_list") or []
-                
-            # 3. Дополнительная очистка, если внутри массива лежат словари, а не строки
-            if img_urls and isinstance(img_urls, list) and isinstance(img_urls[0], dict):
-                img_urls = [img.get("url", img.get("thumb", "")) for img in img_urls if img.get("url") or img.get("thumb")]
-                
-            # Записываем ссылки на фото через запятую в финальную карточку
-            card_data['original_imgs'] = ", ".join(img_urls) if isinstance(img_urls, list) else str(img_urls)
+            card_data['original_imgs'] = original_imgs
             final_cards.append(card_data)
             print(f" -> [OK] {card_data.get('title_ru', '')} (SKU: {card_data.get('sku', '')})")
         else:
@@ -1043,7 +1182,7 @@ async def process_and_export_table(raw_items: list):
             })
             failed_raw_items.append(item)
             print(f"⚠️ [SKIP] Ошибка генерации для товара ID: {item_id}")
-            
+
     if failed_items:
         fail_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         failed_report = f"failed_products_{fail_stamp}.json"
@@ -1074,8 +1213,10 @@ async def main_cli():
     parser.add_argument("--all", action="store_true", help="Парсить весь каталог")
     parser.add_argument("--limit", type=int, help="Переопределить лимит количества товаров")
     parser.add_argument("--single", action="store_true", help="Парсить один товар по ссылке")
+    parser.add_argument("--append-link", action="store_true", help="Докинуть фото с другой ссылки в последний товар черновика")
+    parser.add_argument("--set-manual-meta", action="store_true", help="Вручную задать название и бренд для последнего товара")
     parser.add_argument("--build-table", action="store_true", help="Собрать накопленные товары в Excel через ИИ")
-    
+
     args = parser.parse_args()
 
     # РЕЖИМ 1: Парсинг всего каталога
@@ -1083,7 +1224,7 @@ async def main_cli():
         # Если передан лимит из батника — берем его, иначе — из .env, иначе — 100 по умолчанию
         target_limit = args.limit if args.limit is not None else int(os.getenv("TOTAL_TARGET_PRODUCTS", 100))
         print(f"🚀 Запуск полного парсинга. Цель: {target_limit} товаров.")
-        
+
         # --- ЦИКЛ ПАГИНАЦИИ (STAGE-1) ---
         await main(target_limit)
 
@@ -1093,22 +1234,24 @@ async def main_cli():
         if url_arg:
             await run_single_mode(url_arg)
 
+    # РЕЖИМ 2b: доп. ссылка к последнему товару (только фото)
+    elif args.append_link:
+        await run_append_link_mode()
+
+    # РЕЖИМ 2c: ручные название/бренд к последнему товару
+    elif args.set_manual_meta:
+        await run_set_manual_meta_mode()
+
     # РЕЖИМ 3: Пакетная сборка таблицы из поштучных черновиков
     elif args.build_table:
-        if not os.path.exists(RAW_DUMP_FILE):
-            print(f"❌ Черновик {RAW_DUMP_FILE} не найден! Сначала добавьте товары через пункт 3.")
-            return
-            
-        try:
-            with open(RAW_DUMP_FILE, "r", encoding="utf-8") as f:
-                raw_selected_items = json.load(f)
-        except Exception as e:
-            print(f"❌ Ошибка чтения черновика: {e}")
+        raw_selected_items = load_raw_dump()
+        if not raw_selected_items:
+            print(f"❌ Черновик {RAW_DUMP_FILE} не найден или пуст! Сначала добавьте товары через пункт 3.")
             return
 
         print(f"📂 Загружено {len(raw_selected_items)} товаров из поштучного списка черновиков.")
         await process_and_export_table(raw_selected_items)
-        
+
         # По желанию: очищаем файл-черновик после успешного экспорта в Excel
         try:
             os.remove(RAW_DUMP_FILE)

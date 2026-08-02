@@ -68,13 +68,42 @@ echo ============================================================
 echo.
 .venv\Scripts\python.exe main.py --single
 echo.
+goto :SingleSubMenu
+
+:AppendLinkToLast
+cd /d "%~dp0"
+cls
+echo ============================================================
+echo ДОБАВИТЬ ЕЩЁ ССЫЛКУ К ПОСЛЕДНЕМУ ТОВАРУ
+echo ============================================================
+echo.
+.venv\Scripts\python.exe main.py --append-link
+echo.
+goto :SingleSubMenu
+
+:SetManualMeta
+cd /d "%~dp0"
+cls
+echo ============================================================
+echo РУЧНОЕ НАЗВАНИЕ И БРЕНД (К ПОСЛЕДНЕМУ ТОВАРУ)
+echo ============================================================
+echo.
+.venv\Scripts\python.exe main.py --set-manual-meta
+echo.
+goto :SingleSubMenu
+
+:SingleSubMenu
 echo ------------------------------------------------------------
 echo 1. Добавить ЕЩЕ ОДИН товар
 echo 2. Вернуться в Главное меню
+echo 3. Добавить ещё ссылку к последнему товару
+echo 4. Ввести название и бренд вручную (к последнему)
 echo ------------------------------------------------------------
 set "LOOP_CHOICE="
 set /p "LOOP_CHOICE= Ваш выбор: "
 if "%LOOP_CHOICE%"=="1" goto :RunSingleParserLoop
+if "%LOOP_CHOICE%"=="3" goto :AppendLinkToLast
+if "%LOOP_CHOICE%"=="4" goto :SetManualMeta
 goto :MainMenu
 
 :BuildFinalTable
@@ -104,6 +133,6 @@ echo ============================================================
 echo.
 :: Проверяем, существует ли файл. Если нет — создаем пустой, чтобы Блокнот не ругался
 if not exist ai_prompt.txt echo. > ai_prompt.txt
-:: /wait приостанавливает выполнение батника, пока Павел не закроет Блокнот
+:: /wait приостанавливает работу батника, пока Павел не закроет Блокнот
 start /wait notepad.exe "ai_prompt.txt"
 goto :MainMenu
