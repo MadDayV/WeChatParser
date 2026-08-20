@@ -976,7 +976,7 @@ async def run_set_manual_meta_mode():
     save_raw_dump(data)
     print(f"✅ Для последнего товара записано вручную: «{title}» / {brand}")
     print(f"   Категория: {target['_manual_category']}")
-    print("   При сборке таблицы название и бренд уйдут без ИИ.")
+    print("   При сборке таблицы название, бренд и категория уйдут как введено.")
 
 # Разрешённые пути категорий строго по дереву из ai_prompt.txt
 # Разделитель иерархии категорий для сайта: строго ">" без пробелов вокруг.
@@ -1121,7 +1121,7 @@ def _prompt_menu_choice(title: str, options: List[str], current_path: str = "") 
 
 def prompt_category_path() -> str:
     """Интерактивный выбор категории из дерева (пол + путь)."""
-    print("\n📂 Выбор категории для последнего товара")
+    print("\n📂 Категория")
     gender = _CATEGORY_GENDERS[_prompt_menu_choice("Пол:", list(_CATEGORY_GENDERS))]
 
     node = _category_tree()
@@ -1141,20 +1141,6 @@ def prompt_category_path() -> str:
             print(f"✅ Категория: {path}")
             return path
         node = child
-
-
-async def run_set_category_mode():
-    """П.5: выбрать категорию для последнего товара (ИИ при экспорте не отключается)."""
-    data = load_raw_dump()
-    if not data:
-        print("❌ Черновик пуст. Сначала добавьте товар пунктом 1.")
-        return
-
-    target = data[-1]
-    target["_manual_category"] = prompt_category_path()
-    save_raw_dump(data)
-    print(f"✅ Категория записана: {target['_manual_category']}")
-    print("   При сборке таблицы это поле подставится в Excel.")
 
 
 def _split_category_parts(value: str) -> List[str]:
@@ -1375,7 +1361,6 @@ async def main_cli():
     parser.add_argument("--single", action="store_true", help="Парсить один товар по ссылке")
     parser.add_argument("--append-link", action="store_true", help="Докинуть фото и текст с другой ссылки в последний товар черновика")
     parser.add_argument("--set-manual-meta", action="store_true", help="Вручную задать название, бренд и категорию для последнего товара")
-    parser.add_argument("--set-category", action="store_true", help="Выбрать категорию для последнего товара")
     parser.add_argument("--build-table", action="store_true", help="Собрать накопленные товары в Excel через ИИ")
 
     args = parser.parse_args()
@@ -1402,10 +1387,6 @@ async def main_cli():
     # РЕЖИМ 2c: ручные название/бренд/категория к последнему товару
     elif args.set_manual_meta:
         await run_set_manual_meta_mode()
-
-    # РЕЖИМ 2d: только категория к последнему товару (ИИ не отключается)
-    elif args.set_category:
-        await run_set_category_mode()
 
     # РЕЖИМ 3: Пакетная сборка таблицы из поштучных черновиков
     elif args.build_table:

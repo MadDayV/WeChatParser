@@ -92,31 +92,18 @@ echo.
 echo.
 goto :SingleSubMenu
 
-:SetCategory
-cd /d "%~dp0"
-cls
-echo ============================================================
-echo ВЫБОР КАТЕГОРИИ (К ПОСЛЕДНЕМУ ТОВАРУ)
-echo ============================================================
-echo.
-.venv\Scripts\python.exe main.py --set-category
-echo.
-goto :SingleSubMenu
-
 :SingleSubMenu
 echo ------------------------------------------------------------
 echo 1. Добавить ЕЩЕ ОДИН товар
 echo 2. Вернуться в Главное меню
 echo 3. Добавить ещё ссылку к последнему товару
-echo 4. Ввести название и бренд вручную (к последнему)
-echo 5. Выбрать категорию (к последнему)
+echo 4. Ввести название, бренд и категорию (к последнему)
 echo ------------------------------------------------------------
 set "LOOP_CHOICE="
 set /p "LOOP_CHOICE= Ваш выбор: "
 if "%LOOP_CHOICE%"=="1" goto :RunSingleParserLoop
 if "%LOOP_CHOICE%"=="3" goto :AppendLinkToLast
 if "%LOOP_CHOICE%"=="4" goto :SetManualMeta
-if "%LOOP_CHOICE%"=="5" goto :SetCategory
 goto :MainMenu
 
 :BuildFinalTable
