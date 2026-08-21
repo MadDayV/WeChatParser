@@ -3,7 +3,7 @@ import json
 import time
 import os
 import re
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import httpx
 from pydantic import BaseModel, Field, field_validator, model_validator
 from dotenv import load_dotenv
@@ -304,8 +304,12 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
         
     # Динамически подгружаем актуальный промпт перед каждым запросом к ИИ
     system_prompt = load_system_prompt()
-    
-    user_prompt = f"Данные:\n{raw_text}"
+    user_prompt = (
+        "Ниже данные ОДНОГО конкретного товара с SZWEGO.\n"
+        "Пиши карточку только про него. Примеры из инструкции копировать нельзя.\n"
+        "Если по этим данным нельзя уверенно написать описание — description_ru должен быть пустой строкой \"\".\n\n"
+        f"Данные:\n{raw_text}"
+    )
     
     for attempt in range(1, max_retries + 1):
         try:
@@ -365,16 +369,16 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
                     "X-Title": "Szwego AI Parser"
                 }
 
-                # Пример показывает ТОЛЬКО формат ключей. sku пустой; category — полный путь из дерева.
+                # Пример — ТОЛЬКО ключи JSON. Значения пустые: их нельзя копировать в карточку.
                 json_example = (
                     "{\n"
-                    '  "title_ru_short": "Сумка Louis Vuitton Speedy P9",\n'
-                    '  "title_ru": "Сумка Louis Vuitton Speedy P9 Bandoulière 25",\n'
-                    '  "brand": "Louis Vuitton",\n'
+                    '  "title_ru_short": "",\n'
+                    '  "title_ru": "",\n'
+                    '  "brand": "",\n'
                     '  "sku": "",\n'
-                    '  "description_ru": "<p><strong>Сумка Louis Vuitton Speedy P9</strong> — ультрасовременное переосмысление культового силуэта.</p>\\n\\n<h3>ДНК изделия</h3>\\n<p>Модель выполнена из мягкой кожи теленка премиум-качества.</p>",\n'
-                    '  "category": "Женский>Аксессуары>Сумки и рюкзаки>Через плечо",\n'
-                    '  "tags": ["Сумка", "Louis Vuitton", "Speedy P9"]\n'
+                    '  "description_ru": "",\n'
+                    '  "category": "",\n'
+                    '  "tags": []\n'
                     "}"
                 )
 
@@ -393,7 +397,13 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
                     f"например \"Женский>Аксессуары>Сумки и рюкзаки>Через плечо\". "
                     f"ЗАПРЕЩЕНО короткие названия вроде \"Сумки\", \"Обувь\", \"Одежда и Аксессуары\".\n"
                     f"7. В description_ru переносы строк пиши ТОЛЬКО как экранированные \\n внутри JSON-строки. "
-                    f"Нельзя вставлять реальные переносы строк внутри кавычек JSON."
+                    f"Нельзя вставлять реальные переносы строк внутри кавычек JSON.\n"
+                    f"8. ОПИСАНИЕ (description_ru): пиши ТОЛЬКО про товар из блока «Данные». "
+                    f"Если данных мало и нельзя уверенно описать ИМЕННО эту вещь — description_ru строго \"\". "
+                    f"ЗАПРЕЩЕНО копировать примеры из инструкции (сумки Louis Vuitton Speedy, часы Alhambra и любые другие примеры). "
+                    f"Пустое поле лучше выдумки.\n"
+                    f"9. title_ru_short / title_ru / brand: не подставляй «Сумка Louis Vuitton», если в данных не сумка "
+                    f"или бренд не указан. Нет уверенности — пустые строки."
                 )
 
                 payload = {
@@ -749,21 +759,130 @@ def _normalize_img_list(img_urls) -> List[str]:
     return [str(u).strip() for u in img_urls if str(u).strip()]
 
 
+def _commodity_block(item: dict) -> dict:
+    """Достаёт блок commodity из сырой записи (плоской или вложенной)."""
+    if not isinstance(item, dict):
+        return {}
+    commodity = item.get("commodity")
+    if isinstance(commodity, dict) and commodity:
+        return commodity
+    result = item.get("result") if isinstance(item.get("result"), dict) else {}
+    nested = result.get("commodity") if isinstance(result.get("commodity"), dict) else {}
+    return nested if isinstance(nested, dict) else {}
+
+
+def extract_item_text(item: dict) -> Tuple[str, str]:
+    """Достаёт (title, description) из сырого товара."""
+    if not isinstance(item, dict):
+        return "", ""
+    commodity_block = _commodity_block(item)
+    if commodity_block:
+        title = commodity_block.get("title") or commodity_block.get("theme_name") or ""
+        desc = commodity_block.get("description") or commodity_block.get("content") or ""
+    else:
+        title = item.get("title") or item.get("theme_name") or ""
+        desc = item.get("description") or item.get("content") or ""
+    return str(title or "").strip(), str(desc or "").strip()
+
+
+def _source_text_blob(title: str, desc: str) -> str:
+    return f"{title}\n{desc}".strip()
+
+
+def build_ai_source_text(item: dict) -> str:
+    """Собирает текст для ИИ: первая ссылка + тексты со всех доп. ссылок."""
+    title, desc = extract_item_text(item)
+    parts = [f"Заголовок: {title}\nОписание: {desc}"]
+    extras = item.get("_extra_sources") if isinstance(item, dict) else None
+    if isinstance(extras, list):
+        for i, extra in enumerate(extras, 2):
+            if isinstance(extra, dict):
+                extra_title = str(extra.get("title") or "").strip()
+                extra_desc = str(extra.get("description") or "").strip()
+            else:
+                extra_title, extra_desc = "", str(extra or "").strip()
+            if not extra_title and not extra_desc:
+                continue
+            parts.append(
+                f"--- Источник #{i} ---\nЗаголовок: {extra_title}\nОписание: {extra_desc}"
+            )
+    return "\n\n".join(parts)
+
+
+_EXAMPLE_LEAK_RE = re.compile(
+    r"speedy\s*p9|escale\s*antigua|bandouli[eè]re\s*25|"
+    r"ультрасовременное переосмысление культового силуэта|"
+    r"vcard31800|alhambra|"
+    r"четырехлистного клевера",
+    re.IGNORECASE,
+)
+_CLOTHING_SRC_RE = re.compile(
+    r"t恤|tee\b|t-shirt|短袖|卫衣|外套|夹克|羽绒服|hoodie|jacket|coat|"
+    r"курт|футболк|худи|свитш|поло\b|рубашк|пальто|жилет",
+    re.IGNORECASE,
+)
+_BAG_OUT_RE = re.compile(r"сумк|speedy|\bbag\b|тоут|clutch|handbag", re.IGNORECASE)
+
+
+def meaningful_source_payload(raw_text: str) -> str:
+    """Текст поставщика без служебных подписей «Заголовок/Описание/Источник»."""
+    text = str(raw_text or "")
+    text = re.sub(r"--- Источник #\d+ ---", " ", text)
+    text = re.sub(r"Заголовок:\s*", " ", text)
+    text = re.sub(r"Описание:\s*", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def source_text_is_thin(raw_text: str) -> bool:
+    """Мало/нет текста поставщика — ИИ начнёт копировать примеры из промпта."""
+    return len(meaningful_source_payload(raw_text)) < 12
+
+
+def _card_text_blob(card_data: dict) -> str:
+    return " ".join(
+        str(card_data.get(key) or "")
+        for key in ("title_ru_short", "title_ru", "description_ru", "brand")
+    )
+
+
+def sanitize_hallucinated_card(card_data: dict, source_text: str) -> bool:
+    """
+    Если ИИ скопировал пример из промпта (сумка LV / Alhambra) или написал сумку
+    по одежде — обнуляет выдуманные текстовые поля. True, если почистили.
+    """
+    source = source_text or ""
+    blob = _card_text_blob(card_data)
+    leaked = bool(_EXAMPLE_LEAK_RE.search(blob)) and not _EXAMPLE_LEAK_RE.search(source)
+    type_mismatch = bool(_CLOTHING_SRC_RE.search(source)) and bool(_BAG_OUT_RE.search(blob))
+    if not leaked and not type_mismatch:
+        return False
+
+    card_data["description_ru"] = ""
+    if leaked or _BAG_OUT_RE.search(str(card_data.get("title_ru_short") or "") + " " + str(card_data.get("title_ru") or "")):
+        card_data["title_ru_short"] = ""
+        card_data["title_ru"] = ""
+    brand = str(card_data.get("brand") or "").strip()
+    if leaked and brand.lower() in {"louis vuitton", "van cleef & arpels"} and not re.search(
+        r"louis\s*vuitton|\blv\b|van\s*cleef|vca", source, re.IGNORECASE
+    ):
+        card_data["brand"] = ""
+    tags = card_data.get("tags")
+    if isinstance(tags, list):
+        card_data["tags"] = [t for t in tags if not _EXAMPLE_LEAK_RE.search(str(t)) and not _BAG_OUT_RE.search(str(t))]
+    elif leaked:
+        card_data["tags"] = []
+    return True
+
+
 def extract_image_urls(item: dict) -> List[str]:
     """Достаёт URL фото из сырого товара (commodity или плоская структура)."""
     if not isinstance(item, dict):
         return []
 
     img_urls = []
-    if "commodity" in item and isinstance(item["commodity"], dict):
-        commodity_data = item["commodity"]
+    commodity_data = _commodity_block(item)
+    if commodity_data:
         img_urls = commodity_data.get("imgsSrc") or commodity_data.get("imgs") or []
-
-    if not img_urls:
-        result = item.get("result") if isinstance(item.get("result"), dict) else {}
-        commodity_nested = result.get("commodity") if isinstance(result.get("commodity"), dict) else {}
-        if commodity_nested:
-            img_urls = commodity_nested.get("imgsSrc") or commodity_nested.get("imgs") or []
 
     if not img_urls:
         img_urls = item.get("imgsSrc") or item.get("imgs") or item.get("image_list") or item.get("img_list") or []
@@ -835,14 +954,38 @@ async def run_single_mode(url: str):
         print("❌ Не удалось получить данные товара.")
 
 
+def _merge_extra_source_text(target: dict, new_item: dict, url: str) -> bool:
+    """Дописывает текст доп. ссылки в _extra_sources, если он новый."""
+    incoming_title, incoming_desc = extract_item_text(new_item)
+    blob = _source_text_blob(incoming_title, incoming_desc)
+    if not blob:
+        return False
+
+    first_title, first_desc = extract_item_text(target)
+    seen = {_source_text_blob(first_title, first_desc)}
+    extras = list(target.get("_extra_sources") or [])
+    for extra in extras:
+        if isinstance(extra, dict):
+            seen.add(_source_text_blob(str(extra.get("title") or ""), str(extra.get("description") or "")))
+        else:
+            seen.add(str(extra or "").strip())
+
+    if blob in seen:
+        return False
+
+    extras.append({"title": incoming_title, "description": incoming_desc, "url": url})
+    target["_extra_sources"] = extras
+    return True
+
+
 async def run_append_link_mode():
-    """П.3: докинуть фото с другой ссылки в последний товар черновика."""
+    """П.3: докинуть фото и текст с другой ссылки в последний товар черновика."""
     data = load_raw_dump()
     if not data:
         print("❌ Черновик пуст. Сначала добавьте товар пунктом 1.")
         return
 
-    url = input("👉 Вставьте ссылку с доп. фото для ПОСЛЕДНЕГО товара: ").strip()
+    url = input("👉 Вставьте ссылку с доп. фото/описанием для ПОСЛЕДНЕГО товара: ").strip()
     if not url.startswith("http"):
         print("❌ Строка не похожа на ссылку! Проверьте ввод.")
         return
@@ -863,21 +1006,32 @@ async def run_append_link_mode():
             seen.add(img_url)
             added.append(img_url)
 
-    if not added:
-        print("ℹ️ Новых фото не найдено (все уже есть в последнем товаре).")
+    added_text = _merge_extra_source_text(target, new_item, url)
+
+    if not added and not added_text:
+        print("ℹ️ Новых фото и текста не найдено (всё уже есть в последнем товаре).")
         return
 
-    merged = existing + added
-    set_image_urls(target, merged)
+    if added:
+        merged = existing + added
+        set_image_urls(target, merged)
+    else:
+        merged = existing
+
     save_raw_dump(data)
+    extra_count = len(target.get("_extra_sources") or [])
     print(
         f"✅ К последнему товару добавлено фото: {len(added)}. "
-        f"Всего фото: {len(merged)}. Товаров в черновике: {len(data)}."
+        f"Всего фото: {len(merged)}. "
+        f"Доп. текстов для ИИ: {extra_count}. "
+        f"Товаров в черновике: {len(data)}."
     )
+    if added_text:
+        print("   Текст с этой ссылки тоже пойдёт в описание при сборке таблицы.")
 
 
 async def run_set_manual_meta_mode():
-    """П.4: вручную задать короткое название и бренд для последнего товара (без ИИ при экспорте)."""
+    """П.4: вручную задать название, бренд и категорию для последнего товара."""
     data = load_raw_dump()
     if not data:
         print("❌ Черновик пуст. Сначала добавьте товар пунктом 1.")
@@ -893,9 +1047,11 @@ async def run_set_manual_meta_mode():
     target["_manual_export"] = True
     target["_manual_title_ru_short"] = title
     target["_manual_brand"] = brand
+    target["_manual_category"] = prompt_category_path()
     save_raw_dump(data)
     print(f"✅ Для последнего товара записано вручную: «{title}» / {brand}")
-    print("   При сборке таблицы этот товар уйдёт без ИИ.")
+    print(f"   Категория: {target['_manual_category']}")
+    print("   При сборке таблицы название, бренд и категория уйдут как введено.")
 
 # Разрешённые пути категорий строго по дереву из ai_prompt.txt
 # Разделитель иерархии категорий для сайта: строго ">" без пробелов вокруг.
@@ -1003,6 +1159,63 @@ _CATEGORY_ALIASES = {
     "платье": "Одежда>Платья",
     "юбка": "Одежда>Юбки",
 }
+
+
+def _category_tree() -> dict:
+    """Дерево выбора из _CATEGORY_LEAVES: узел — dict, лист — None."""
+    tree: dict = {}
+    for leaf in _CATEGORY_LEAVES:
+        parts = [p for p in leaf.split(CATEGORY_SEP) if p]
+        node = tree
+        for i, part in enumerate(parts):
+            is_last = i == len(parts) - 1
+            if is_last:
+                node.setdefault(part, None)
+            else:
+                child = node.get(part)
+                if not isinstance(child, dict):
+                    node[part] = {}
+                node = node[part]
+    return tree
+
+
+def _prompt_menu_choice(title: str, options: List[str], current_path: str = "") -> int:
+    """Нумерованное меню. Возвращает индекс выбранного пункта."""
+    while True:
+        print()
+        if current_path:
+            print(f"Сейчас: {current_path}")
+        print(title)
+        for i, option in enumerate(options, 1):
+            print(f"{i}. {option}")
+        raw = input(f"👉 Номер (1-{len(options)}): ").strip()
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return int(raw) - 1
+        print("❌ Неверный номер, попробуйте ещё раз.")
+
+
+def prompt_category_path() -> str:
+    """Интерактивный выбор категории из дерева (пол + путь)."""
+    print("\n📂 Категория")
+    gender = _CATEGORY_GENDERS[_prompt_menu_choice("Пол:", list(_CATEGORY_GENDERS))]
+
+    node = _category_tree()
+    chosen: List[str] = []
+    while True:
+        keys = list(node.keys())
+        labels = [
+            key if node[key] is None else f"{key} ..."
+            for key in keys
+        ]
+        current = _join_category_parts([gender] + chosen)
+        key = keys[_prompt_menu_choice("Раздел:", labels, current)]
+        chosen.append(key)
+        child = node[key]
+        if child is None:
+            path = _join_category_parts([gender] + chosen)
+            print(f"✅ Категория: {path}")
+            return path
+        node = child
 
 
 def _split_category_parts(value: str) -> List[str]:
@@ -1131,22 +1344,12 @@ async def process_and_export_table(raw_items: list):
     failed_raw_items = []
 
     for idx, item in enumerate(raw_items, 1):
-        # === ОБНОВЛЕННЫЙ СБОР ТЕКСТА ПОД КОНТРАКТ COMMODITY ===
-        # 1. Проверяем вложенную структуру (result -> commodity)
-        commodity_block = item.get('commodity', item.get('result', {}).get('commodity', {})) if isinstance(item, dict) else {}
-
-        # 2. Извлекаем заголовок и описание с учетом вложенности
-        if commodity_block:
-            title = commodity_block.get('title', '')
-            desc = commodity_block.get('description', commodity_block.get('content', ''))
-        else:
-            # Резервный вариант для старой плоской структуры
-            title = item.get('title', item.get('theme_name', ''))
-            desc = item.get('description', item.get('content', ''))
+        title, _desc = extract_item_text(item) if isinstance(item, dict) else ("", "")
 
         item_id = resolve_item_id(item, idx)
         img_urls = extract_image_urls(item)
         original_imgs = ", ".join(img_urls) if img_urls else ""
+        manual_category = str(item.get("_manual_category") or "").strip() if isinstance(item, dict) else ""
 
         # Ручной режим: название/бренд от заказчика, без ИИ
         if item.get("_manual_export"):
@@ -1169,17 +1372,34 @@ async def process_and_export_table(raw_items: list):
                 "brand": manual_brand,
                 "sku": "",
                 "description_ru": "",
-                "category": "",
+                "category": manual_category,
                 "tags": [],
                 "szwego_id": item_id,
                 "original_imgs": original_imgs,
             }
             final_cards.append(card_data)
-            print(f" -> [OK MANUAL] {manual_title} / {manual_brand}")
+            print(f" -> [OK MANUAL] {manual_title} / {manual_brand} / {manual_category or 'без категории'}")
             continue
 
-        # 3. Собираем финальный текст для отправки в OpenRouter
-        raw_text = f"Заголовок: {title}\nОписание: {desc}"
+        # 3. Собираем финальный текст для отправки в OpenRouter (все ссылки товара)
+        raw_text = build_ai_source_text(item)
+
+        if source_text_is_thin(raw_text):
+            print(f" ℹ️ [{idx}/{len(raw_items)}] Нет текста поставщика ID: {item_id} — описание не выдумываю.")
+            card_data = {
+                "title_ru_short": str(title)[:200] if title else "",
+                "title_ru": str(title) if title else "",
+                "brand": "",
+                "sku": "",
+                "description_ru": "",
+                "category": manual_category,
+                "tags": [],
+                "szwego_id": item_id,
+                "original_imgs": original_imgs,
+            }
+            final_cards.append(card_data)
+            print(" -> [OK EMPTY] Описание пустое (нет исходного текста)")
+            continue
 
         print(f" 🤖 [{idx}/{len(raw_items)}] Обработка товара ID: {item_id}...")
         ai_card = await generate_ai_card(raw_text)
@@ -1188,6 +1408,10 @@ async def process_and_export_table(raw_items: list):
             card_data = ai_card.model_dump() if hasattr(ai_card, 'model_dump') else ai_card
             card_data['szwego_id'] = item_id
             card_data['original_imgs'] = original_imgs
+            if manual_category:
+                card_data['category'] = manual_category
+            if sanitize_hallucinated_card(card_data, raw_text):
+                print("    ⚠️ Похоже на выдумку/пример из промпта — текстовые поля очищены.")
             final_cards.append(card_data)
             print(f" -> [OK] {card_data.get('title_ru', '')} (SKU: {card_data.get('sku', '')})")
         else:
@@ -1229,8 +1453,8 @@ async def main_cli():
     parser.add_argument("--all", action="store_true", help="Парсить весь каталог")
     parser.add_argument("--limit", type=int, help="Переопределить лимит количества товаров")
     parser.add_argument("--single", action="store_true", help="Парсить один товар по ссылке")
-    parser.add_argument("--append-link", action="store_true", help="Докинуть фото с другой ссылки в последний товар черновика")
-    parser.add_argument("--set-manual-meta", action="store_true", help="Вручную задать название и бренд для последнего товара")
+    parser.add_argument("--append-link", action="store_true", help="Докинуть фото и текст с другой ссылки в последний товар черновика")
+    parser.add_argument("--set-manual-meta", action="store_true", help="Вручную задать название, бренд и категорию для последнего товара")
     parser.add_argument("--build-table", action="store_true", help="Собрать накопленные товары в Excel через ИИ")
 
     args = parser.parse_args()
@@ -1250,11 +1474,11 @@ async def main_cli():
         if url_arg:
             await run_single_mode(url_arg)
 
-    # РЕЖИМ 2b: доп. ссылка к последнему товару (только фото)
+    # РЕЖИМ 2b: доп. ссылка к последнему товару (фото + текст)
     elif args.append_link:
         await run_append_link_mode()
 
-    # РЕЖИМ 2c: ручные название/бренд к последнему товару
+    # РЕЖИМ 2c: ручные название/бренд/категория к последнему товару
     elif args.set_manual_meta:
         await run_set_manual_meta_mode()
 
