@@ -304,8 +304,12 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
         
     # Динамически подгружаем актуальный промпт перед каждым запросом к ИИ
     system_prompt = load_system_prompt()
-    
-    user_prompt = f"Данные:\n{raw_text}"
+    user_prompt = (
+        "Ниже данные ОДНОГО конкретного товара с SZWEGO.\n"
+        "Пиши карточку только про него. Примеры из инструкции копировать нельзя.\n"
+        "Если по этим данным нельзя уверенно написать описание — description_ru должен быть пустой строкой \"\".\n\n"
+        f"Данные:\n{raw_text}"
+    )
     
     for attempt in range(1, max_retries + 1):
         try:
@@ -365,16 +369,16 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
                     "X-Title": "Szwego AI Parser"
                 }
 
-                # Пример показывает ТОЛЬКО формат ключей. sku пустой; category — полный путь из дерева.
+                # Пример — ТОЛЬКО ключи JSON. Значения пустые: их нельзя копировать в карточку.
                 json_example = (
                     "{\n"
-                    '  "title_ru_short": "Сумка Louis Vuitton Speedy P9",\n'
-                    '  "title_ru": "Сумка Louis Vuitton Speedy P9 Bandoulière 25",\n'
-                    '  "brand": "Louis Vuitton",\n'
+                    '  "title_ru_short": "",\n'
+                    '  "title_ru": "",\n'
+                    '  "brand": "",\n'
                     '  "sku": "",\n'
-                    '  "description_ru": "<p><strong>Сумка Louis Vuitton Speedy P9</strong> — ультрасовременное переосмысление культового силуэта.</p>\\n\\n<h3>ДНК изделия</h3>\\n<p>Модель выполнена из мягкой кожи теленка премиум-качества.</p>",\n'
-                    '  "category": "Женский>Аксессуары>Сумки и рюкзаки>Через плечо",\n'
-                    '  "tags": ["Сумка", "Louis Vuitton", "Speedy P9"]\n'
+                    '  "description_ru": "",\n'
+                    '  "category": "",\n'
+                    '  "tags": []\n'
                     "}"
                 )
 
@@ -393,7 +397,13 @@ async def generate_ai_card(raw_text: str, max_retries: int = 3) -> Optional[Prod
                     f"например \"Женский>Аксессуары>Сумки и рюкзаки>Через плечо\". "
                     f"ЗАПРЕЩЕНО короткие названия вроде \"Сумки\", \"Обувь\", \"Одежда и Аксессуары\".\n"
                     f"7. В description_ru переносы строк пиши ТОЛЬКО как экранированные \\n внутри JSON-строки. "
-                    f"Нельзя вставлять реальные переносы строк внутри кавычек JSON."
+                    f"Нельзя вставлять реальные переносы строк внутри кавычек JSON.\n"
+                    f"8. ОПИСАНИЕ (description_ru): пиши ТОЛЬКО про товар из блока «Данные». "
+                    f"Если данных мало и нельзя уверенно описать ИМЕННО эту вещь — description_ru строго \"\". "
+                    f"ЗАПРЕЩЕНО копировать примеры из инструкции (сумки Louis Vuitton Speedy, часы Alhambra и любые другие примеры). "
+                    f"Пустое поле лучше выдумки.\n"
+                    f"9. title_ru_short / title_ru / brand: не подставляй «Сумка Louis Vuitton», если в данных не сумка "
+                    f"или бренд не указан. Нет уверенности — пустые строки."
                 )
 
                 payload = {
@@ -797,6 +807,71 @@ def build_ai_source_text(item: dict) -> str:
                 f"--- Источник #{i} ---\nЗаголовок: {extra_title}\nОписание: {extra_desc}"
             )
     return "\n\n".join(parts)
+
+
+_EXAMPLE_LEAK_RE = re.compile(
+    r"speedy\s*p9|escale\s*antigua|bandouli[eè]re\s*25|"
+    r"ультрасовременное переосмысление культового силуэта|"
+    r"vcard31800|alhambra|"
+    r"четырехлистного клевера",
+    re.IGNORECASE,
+)
+_CLOTHING_SRC_RE = re.compile(
+    r"t恤|tee\b|t-shirt|短袖|卫衣|外套|夹克|羽绒服|hoodie|jacket|coat|"
+    r"курт|футболк|худи|свитш|поло\b|рубашк|пальто|жилет",
+    re.IGNORECASE,
+)
+_BAG_OUT_RE = re.compile(r"сумк|speedy|\bbag\b|тоут|clutch|handbag", re.IGNORECASE)
+
+
+def meaningful_source_payload(raw_text: str) -> str:
+    """Текст поставщика без служебных подписей «Заголовок/Описание/Источник»."""
+    text = str(raw_text or "")
+    text = re.sub(r"--- Источник #\d+ ---", " ", text)
+    text = re.sub(r"Заголовок:\s*", " ", text)
+    text = re.sub(r"Описание:\s*", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def source_text_is_thin(raw_text: str) -> bool:
+    """Мало/нет текста поставщика — ИИ начнёт копировать примеры из промпта."""
+    return len(meaningful_source_payload(raw_text)) < 12
+
+
+def _card_text_blob(card_data: dict) -> str:
+    return " ".join(
+        str(card_data.get(key) or "")
+        for key in ("title_ru_short", "title_ru", "description_ru", "brand")
+    )
+
+
+def sanitize_hallucinated_card(card_data: dict, source_text: str) -> bool:
+    """
+    Если ИИ скопировал пример из промпта (сумка LV / Alhambra) или написал сумку
+    по одежде — обнуляет выдуманные текстовые поля. True, если почистили.
+    """
+    source = source_text or ""
+    blob = _card_text_blob(card_data)
+    leaked = bool(_EXAMPLE_LEAK_RE.search(blob)) and not _EXAMPLE_LEAK_RE.search(source)
+    type_mismatch = bool(_CLOTHING_SRC_RE.search(source)) and bool(_BAG_OUT_RE.search(blob))
+    if not leaked and not type_mismatch:
+        return False
+
+    card_data["description_ru"] = ""
+    if leaked or _BAG_OUT_RE.search(str(card_data.get("title_ru_short") or "") + " " + str(card_data.get("title_ru") or "")):
+        card_data["title_ru_short"] = ""
+        card_data["title_ru"] = ""
+    brand = str(card_data.get("brand") or "").strip()
+    if leaked and brand.lower() in {"louis vuitton", "van cleef & arpels"} and not re.search(
+        r"louis\s*vuitton|\blv\b|van\s*cleef|vca", source, re.IGNORECASE
+    ):
+        card_data["brand"] = ""
+    tags = card_data.get("tags")
+    if isinstance(tags, list):
+        card_data["tags"] = [t for t in tags if not _EXAMPLE_LEAK_RE.search(str(t)) and not _BAG_OUT_RE.search(str(t))]
+    elif leaked:
+        card_data["tags"] = []
+    return True
 
 
 def extract_image_urls(item: dict) -> List[str]:
@@ -1309,6 +1384,23 @@ async def process_and_export_table(raw_items: list):
         # 3. Собираем финальный текст для отправки в OpenRouter (все ссылки товара)
         raw_text = build_ai_source_text(item)
 
+        if source_text_is_thin(raw_text):
+            print(f" ℹ️ [{idx}/{len(raw_items)}] Нет текста поставщика ID: {item_id} — описание не выдумываю.")
+            card_data = {
+                "title_ru_short": str(title)[:200] if title else "",
+                "title_ru": str(title) if title else "",
+                "brand": "",
+                "sku": "",
+                "description_ru": "",
+                "category": manual_category,
+                "tags": [],
+                "szwego_id": item_id,
+                "original_imgs": original_imgs,
+            }
+            final_cards.append(card_data)
+            print(" -> [OK EMPTY] Описание пустое (нет исходного текста)")
+            continue
+
         print(f" 🤖 [{idx}/{len(raw_items)}] Обработка товара ID: {item_id}...")
         ai_card = await generate_ai_card(raw_text)
 
@@ -1318,6 +1410,8 @@ async def process_and_export_table(raw_items: list):
             card_data['original_imgs'] = original_imgs
             if manual_category:
                 card_data['category'] = manual_category
+            if sanitize_hallucinated_card(card_data, raw_text):
+                print("    ⚠️ Похоже на выдумку/пример из промпта — текстовые поля очищены.")
             final_cards.append(card_data)
             print(f" -> [OK] {card_data.get('title_ru', '')} (SKU: {card_data.get('sku', '')})")
         else:
